@@ -11,6 +11,7 @@ from unittest import TestCase
 
 
 SCRIPT = Path("/home/usow/codexlab/codexlab.py")
+INSTALL_SCRIPT = Path("/home/usow/codexlab/scripts/install-codexlab.sh")
 
 
 class CodexLabCliTests(TestCase):
@@ -110,6 +111,40 @@ raise SystemExit(int(entry.get("exit_code", 0)))
             "FAKE_CODEX_PLAN": str(plan_path),
             "FAKE_CODEX_COUNTER": str(counter_path),
         }
+
+    def test_install_script_creates_wrapper_and_wrapper_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp = Path(tmpdir)
+            home = temp / "home"
+            install_dir = home / "bin"
+            shell_rc = home / ".bashrc"
+            root = temp / "lab-root"
+            home.mkdir(parents=True, exist_ok=True)
+
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            subprocess.run(
+                ["bash", str(INSTALL_SCRIPT), "--install-dir", str(install_dir), "--shell-rc", str(shell_rc)],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            wrapper = install_dir / "codexlab"
+            self.assertTrue(wrapper.is_symlink())
+            self.assertEqual(shell_rc.read_text(encoding="utf-8").strip(), 'export PATH="$HOME/bin:$PATH"')
+
+            wrapped = subprocess.run(
+                [str(wrapper), "status", "--json"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**env, "CODEXLAB_ROOT": str(root)},
+            )
+            payload = json.loads(wrapped.stdout)
+            self.assertEqual(payload["root"], str(root))
+            self.assertEqual(len(payload["lanes"]), 3)
 
     def test_submit_assigns_both_workers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

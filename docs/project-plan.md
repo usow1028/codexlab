@@ -7,7 +7,7 @@ This roadmap tracks the path from the current prototype to a fully operational `
 - Date: `2026-04-06`
 - Overall completion: about `99%`
 - Current state:
-  - `done`: state model, task/submission/evaluation persistence, champion-challenger logic, retry queue, role swap logic, `mock` executor, first `codex` executor path, prompt templates, status/doctor/watch/tick/run-loop CLI, daemon lifecycle commands, workspace cleanup, timeout-aware codex execution, run inspection commands, rubric-based evaluator scoring
+  - `done`: state model, task/submission/evaluation persistence, champion-challenger logic, retry queue, role swap logic, `mock` executor, first `codex` executor path, prompt templates, status/doctor/watch/tick/run-loop CLI, daemon lifecycle commands, workspace cleanup, timeout-aware codex execution, run inspection commands, rubric-based evaluator scoring, cross-machine wrapper installer
   - `in progress`: deeper real Codex hardening, richer operator dashboard/TUI, and final crash-resume orchestration polish
   - `pending`: release polish
 

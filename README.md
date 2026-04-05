@@ -51,6 +51,26 @@ codexlab watch --dashboard --once
 codexlab tui
 ```
 
+## Install on another machine
+
+Git clone alone cannot safely auto-install a wrapper into your shell environment.
+Use the bundled installer once after cloning:
+
+```bash
+git clone git@github.com:usow1028/codexlab.git
+cd codexlab
+bash scripts/install-codexlab.sh
+source ~/.bashrc
+codexlab doctor
+```
+
+If you do not want shell rc changes, install the wrapper only:
+
+```bash
+bash scripts/install-codexlab.sh --skip-path
+~/bin/codexlab doctor
+```
+
 ## Current scope
 
 The current stage now covers both the control plane and a first automated runner:
