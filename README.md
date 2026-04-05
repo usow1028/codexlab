@@ -1,15 +1,15 @@
-  codex login
-  cd ~
-  git clone git@github.com:usow1028/codexlab.git
-  cd codexlab
-  bash scripts/install-codexlab.sh
-  source ~/.bashrc
-  codexlab doctor
+codex login
+cd ~
+git clone git@github.com:usow1028/codexlab.git
+cd codexlab
+bash scripts/install-codexlab.sh
+source ~/.bashrc
+codexlab doctor
 
-  설치 후 바로 이어서 작업하려면:
+설치 후 바로 이어서 작업하려면:
 
-  cd ~/codexlab
-  codex
+cd ~/codexlab
+codex
 
 
 # CodexLab
