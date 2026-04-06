@@ -5,8 +5,10 @@ control/control.db
 control/control.db-shm
 control/control.db-wal
 control/daemon/
+control/smoke/
 control/events/*.jsonl
 control/runs/
 agents/*/home/*
 agents/*/workspace/*
 tasks/T-*/
+.vendor/
