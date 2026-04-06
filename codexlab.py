@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import deque
+import concurrent.futures
 import json
 import os
 import re
@@ -67,10 +68,21 @@ RESILIENCE_AUTH_PATH = LOGIN_CODEX_HOME / "auth.json"
 RESILIENCE_SCRATCH_DIR = RESILIENCE_POOL_PATH.parent / "probe-homes"
 DEFAULT_EXECUTOR = os.environ.get("CODEXLAB_EXECUTOR", "mock")
 LIVE_DEFAULT_EXECUTOR = os.environ.get("CODEXLAB_LIVE_EXECUTOR", "codex")
-DEFAULT_EXEC_TIMEOUT = float(os.environ.get("CODEXLAB_EXEC_TIMEOUT", "120"))
+_BASE_EXEC_TIMEOUT = os.environ.get("CODEXLAB_EXEC_TIMEOUT")
+DEFAULT_MOCK_EXEC_TIMEOUT = float(os.environ.get("CODEXLAB_MOCK_EXEC_TIMEOUT", _BASE_EXEC_TIMEOUT or "120"))
+DEFAULT_CODEX_EXEC_TIMEOUT = float(os.environ.get("CODEXLAB_CODEX_EXEC_TIMEOUT", _BASE_EXEC_TIMEOUT or "600"))
+DEFAULT_EXEC_TIMEOUT = DEFAULT_MOCK_EXEC_TIMEOUT
 DEFAULT_WATCH_INTERVAL = float(os.environ.get("CODEXLAB_WATCH_INTERVAL", "1.0"))
 DEFAULT_EVENTS_LIMIT = int(os.environ.get("CODEXLAB_EVENTS_LIMIT", "12"))
 DEFAULT_QUOTA_RECHECK_INTERVAL = float(os.environ.get("CODEXLAB_QUOTA_RECHECK_INTERVAL", "60"))
+DEFAULT_RESILIENCE_RECHECK_INTERVAL = float(os.environ.get("CODEXLAB_RESILIENCE_RECHECK_INTERVAL", "60"))
+_USAGE_PROBE_WORKERS_OVERRIDE = os.environ.get("CODEXLAB_USAGE_PROBE_WORKERS")
+DEFAULT_USAGE_PROBE_WORKERS = (
+    max(1, int(_USAGE_PROBE_WORKERS_OVERRIDE))
+    if _USAGE_PROBE_WORKERS_OVERRIDE is not None
+    else None
+)
+MAX_DAEMON_STATE_FILE_BYTES = int(os.environ.get("CODEXLAB_MAX_DAEMON_STATE_FILE_BYTES", str(1024 * 1024)))
 AUTO_QUOTA_RECOVERY = os.environ.get("CODEXLAB_AUTO_RECOVER_QUOTA", "1").strip().lower() not in {"0", "false", "no", "off"}
 SCHEMA_VERSION = 4
 STREAM_EVENT_TYPES = {
@@ -86,9 +98,42 @@ STREAM_EVENT_TYPES = {
     "run_resume_fallback",
     "quota_probe",
     "quota_auto_resume",
+    "resilience_paused",
+    "resilience_resumed",
     "daemon_started",
     "daemon_stopped",
 }
+
+
+def default_exec_timeout_for(executor: str) -> float:
+    return DEFAULT_CODEX_EXEC_TIMEOUT if executor == "codex" else DEFAULT_MOCK_EXEC_TIMEOUT
+
+
+def current_animation_phase() -> int:
+    return int(time.time() * 2)
+
+
+def animated_state_icon(state: str, *, phase: int | None = None) -> str:
+    frame = current_animation_phase() if phase is None else max(0, int(phase))
+    if state == "RUNNING":
+        return ("|", "/", "-", "\\")[frame % 4]
+    if state == "RECOVERING":
+        return (".", "o", "O", "o")[frame % 4]
+    if state == "BLOCKED":
+        return ("!", ".", "!", ".")[frame % 4]
+    if state == "WAITING":
+        return (".", "o", ".", "o")[frame % 4]
+    if state == "READY":
+        return "+"
+    if state == "DONE":
+        return "*"
+    if state == "PAUSED":
+        return ";"
+    return "-"
+
+
+def render_state_label(state: str, *, phase: int | None = None) -> str:
+    return f"{animated_state_icon(state, phase=phase)} {state}"
 WORKER_LANES = ("worker-a", "worker-b")
 ALL_LANES = (
     ("worker-a", "worker"),
@@ -143,12 +188,13 @@ CONSOLE_SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/all", "show every task"),
     ("/refresh", "reload the operator snapshot"),
     ("/clear-tasks", "wipe runtime task history"),
-    ("/profile register <alias>", "login and save a new profile"),
+    ("/profile register", "login and save the next numbered profile"),
     ("/profile list", "list registered profiles"),
     ("/profile current", "show the active profile"),
     ("/profile activate <account_key|alias>", "switch to a stored profile"),
     ("/profile disable <account_key|alias>", "exclude a profile from rotation"),
     ("/profile enable <account_key|alias>", "return a profile to rotation"),
+    ("/profile renumber", "rename stored aliases to 1, 2, 3..."),
     ("/profile reset-exhausted", "mark exhausted profiles ready again"),
     ("/auto-switch on", "enable quota-triggered profile rotation"),
     ("/auto-switch off", "disable quota-triggered profile rotation"),
@@ -581,6 +627,76 @@ def resilience_current_label(summary: dict[str, Any]) -> str:
     return str(current_key)
 
 
+def resilience_guard_snapshot(summary: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        vault = credential_vault()
+        return vault.reserve_guard(vault.load() if summary is None else None) if summary is None else {
+            **vault.reserve_guard(
+                {
+                    "version": 1,
+                    "current_account_key": summary.get("current_account_key"),
+                    "auto_switch": summary.get("auto_switch", True),
+                    "last_rotation": summary.get("last_rotation") or {},
+                    "reserve_percent_threshold": summary.get("reserve_percent_threshold"),
+                    "accounts": {
+                        profile.get("account_key"): {
+                            "alias": profile.get("alias"),
+                            "status": profile.get("status"),
+                            "fingerprint": {"email": profile.get("email"), "account_id": None},
+                            "auth_data": {},
+                            "last_sync": profile.get("last_sync"),
+                            "usage_state": profile.get("usage_state"),
+                            "last_quota_blocked_at": profile.get("last_quota_blocked_at"),
+                            "last_quota_reason": profile.get("last_quota_reason"),
+                            "last_activated_at": None,
+                            "last_verified_at": profile.get("last_verified_at"),
+                            "usage_percent_remaining": profile.get("usage_percent_remaining"),
+                            "usage_percent_used": profile.get("usage_percent_used"),
+                            "usage_window_minutes": profile.get("usage_window_minutes"),
+                            "usage_resets_at": profile.get("usage_resets_at"),
+                            "usage_plan_type": profile.get("usage_plan_type"),
+                            "usage_limit_id": profile.get("usage_limit_id"),
+                            "usage_checked_at": profile.get("usage_checked_at"),
+                        }
+                        for profile in summary.get("profiles", [])
+                    },
+                }
+            ),
+            "summary_cached": True,
+        }
+    except Exception as exc:
+        return {
+            "active": False,
+            "reason": f"resilience guard unavailable: {exc}",
+            "current_account_key": None,
+            "current_email": None,
+            "current_remaining": None,
+            "reserve_percent_threshold": None,
+            "available_alternatives": [],
+            "checked_at": now_utc(),
+        }
+
+
+def refresh_resilience_usage_summary(*, all_profiles: bool) -> dict[str, Any]:
+    try:
+        return probe_resilience_usage(all_profiles=all_profiles)
+    except Exception:
+        return resilience_summary()
+
+
+def resilience_execution_guard(*, refresh_usage: bool = False) -> dict[str, Any]:
+    summary = refresh_resilience_usage_summary(all_profiles=True) if refresh_usage else resilience_summary()
+    return resilience_guard_snapshot(summary)
+
+
+def usage_probe_worker_count(account_count: int) -> int:
+    if account_count <= 1:
+        return 1
+    if DEFAULT_USAGE_PROBE_WORKERS is None:
+        return account_count
+    return max(1, min(DEFAULT_USAGE_PROBE_WORKERS, account_count))
+
+
 def try_sync_current_resilience_profile() -> None:
     try:
         vault = credential_vault()
@@ -604,15 +720,19 @@ def ensure_selected_resilience_profile() -> str | None:
         return None
 
 
-def run_resilience_profile_login(alias: str) -> str:
+def run_resilience_profile_login(alias: str | None = None) -> str:
     LOGIN_CODEX_HOME.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["CODEX_HOME"] = str(LOGIN_CODEX_HOME)
+    requested_alias = (alias or "").strip()
     print("")
-    print(f"Starting codex login for profile alias={alias}")
+    if requested_alias:
+        print(f"Starting codex login for profile alias={requested_alias}")
+    else:
+        print("Starting codex login for the next numbered profile")
     print(f"Login home: {LOGIN_CODEX_HOME}")
     subprocess.run([REAL_CODEX, "login"], check=True, env=env)
-    account_key = credential_vault().register_current(alias)
+    account_key = credential_vault().register_current(requested_alias or None)
     return account_key
 
 
@@ -973,9 +1093,147 @@ def daemon_pid_payload() -> dict[str, Any] | None:
     return payload
 
 
+def truncate_text(value: Any, limit: int = 240) -> Any:
+    if not isinstance(value, str):
+        return value
+    if len(value) <= limit:
+        return value
+    return value[: max(limit - 3, 0)] + "..."
+
+
+def compact_quota_monitor(monitor: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(monitor, dict):
+        return {}
+    blocked_lanes = []
+    for item in monitor.get("blocked_lanes") or []:
+        if not isinstance(item, dict):
+            continue
+        blocked_lanes.append(
+            {
+                "lane_id": item.get("lane_id"),
+                "lane_type": item.get("lane_type"),
+                "task_id": item.get("task_id"),
+                "run_id": item.get("run_id"),
+                "mode": item.get("mode"),
+                "message": truncate_text(item.get("message")),
+            }
+        )
+    probe = monitor.get("last_probe") if isinstance(monitor.get("last_probe"), dict) else {}
+    return {
+        "enabled": bool(monitor.get("enabled", False)),
+        "status": monitor.get("status"),
+        "login_identity": monitor.get("login_identity") if isinstance(monitor.get("login_identity"), dict) else {},
+        "current_identity_fingerprint": monitor.get("current_identity_fingerprint"),
+        "recheck_interval_seconds": monitor.get("recheck_interval_seconds"),
+        "blocked_lanes": blocked_lanes,
+        "identity_changed": bool(monitor.get("identity_changed", False)),
+        "last_probe_at": monitor.get("last_probe_at"),
+        "last_probe_identity": monitor.get("last_probe_identity"),
+        "last_probe": {
+            "ok": probe.get("ok"),
+            "quota_blocked": probe.get("quota_blocked"),
+            "exit_code": probe.get("exit_code"),
+            "message": truncate_text(probe.get("message")),
+        }
+        if probe
+        else {},
+        "last_recovered_at": monitor.get("last_recovered_at"),
+    }
+
+
+def compact_daemon_actions(actions: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for action in (actions or [])[:8]:
+        if not isinstance(action, dict):
+            continue
+        compacted.append({key: truncate_text(value) for key, value in action.items()})
+    return compacted
+
+
+def compact_daemon_state_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict) or not payload:
+        return {}
+    resilience_guard = payload.get("resilience_guard") if isinstance(payload.get("resilience_guard"), dict) else {}
+    return {
+        "pid": int(payload.get("pid", 0) or 0),
+        "executor": payload.get("executor"),
+        "interval": payload.get("interval"),
+        "cycle_count": payload.get("cycle_count"),
+        "started_at": payload.get("started_at"),
+        "last_heartbeat": payload.get("last_heartbeat"),
+        "last_progress": bool(payload.get("last_progress", False)),
+        "last_progress_at": payload.get("last_progress_at"),
+        "runnable_after": bool(payload.get("runnable_after", False)),
+        "stop_requested": bool(payload.get("stop_requested", False)),
+        "reason": payload.get("reason"),
+        "last_actions": compact_daemon_actions(payload.get("last_actions")),
+        "quota_monitor": compact_quota_monitor(payload.get("quota_monitor")),
+        "resilience_guard": {
+            "active": bool(resilience_guard.get("active", False)),
+            "reason": truncate_text(resilience_guard.get("reason")),
+            "current_account_key": resilience_guard.get("current_account_key"),
+            "current_email": resilience_guard.get("current_email"),
+            "current_remaining": resilience_guard.get("current_remaining"),
+            "reserve_percent_threshold": resilience_guard.get("reserve_percent_threshold"),
+            "available_alternatives": list(resilience_guard.get("available_alternatives") or [])[:8],
+            "checked_at": resilience_guard.get("checked_at"),
+        }
+        if resilience_guard
+        else {},
+        "exec_timeout": payload.get("exec_timeout"),
+        "stopped_at": payload.get("stopped_at"),
+        "running": bool(payload.get("running", False)),
+        "state_compacted": bool(payload.get("state_compacted", False) or ("status_snapshot" in payload)),
+    }
+
+
+def oversized_daemon_state_payload(*, pid_payload: dict[str, Any] | None, state_file: Path) -> dict[str, Any]:
+    stat = state_file.stat()
+    pid = int(pid_payload.get("pid", 0) or 0) if pid_payload else 0
+    return compact_daemon_state_payload(
+        {
+            "pid": pid,
+            "executor": pid_payload.get("executor") if pid_payload else None,
+            "interval": pid_payload.get("interval") if pid_payload else None,
+            "started_at": pid_payload.get("started_at") if pid_payload else None,
+            "last_heartbeat": datetime.fromtimestamp(stat.st_mtime, timezone.utc).replace(microsecond=0).isoformat(),
+            "last_progress": False,
+            "runnable_after": False,
+            "stop_requested": False,
+            "reason": "oversized_state_file",
+            "last_actions": [],
+            "quota_monitor": {},
+            "exec_timeout": pid_payload.get("exec_timeout") if pid_payload else None,
+            "running": bool(pid_payload and process_alive(pid)),
+            "state_compacted": True,
+        }
+    )
+
+
+def read_daemon_state_payload(pid_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not DAEMON_STATE_FILE.exists():
+        return {}
+    pid = int(pid_payload.get("pid", 0) or 0) if pid_payload else 0
+    running = bool(pid_payload and process_alive(pid))
+    try:
+        size = DAEMON_STATE_FILE.stat().st_size
+    except OSError:
+        size = 0
+    if size > MAX_DAEMON_STATE_FILE_BYTES:
+        compacted = oversized_daemon_state_payload(pid_payload=pid_payload, state_file=DAEMON_STATE_FILE)
+        if not running:
+            write_json(DAEMON_STATE_FILE, compacted)
+        return compacted
+    payload = read_json(DAEMON_STATE_FILE, tolerate_empty=True, tolerate_invalid=True) or {}
+    compacted = compact_daemon_state_payload(payload)
+    if compacted != payload and not running:
+        write_json(DAEMON_STATE_FILE, compacted)
+    return compacted
+
+
 def daemon_runtime_snapshot() -> dict[str, Any]:
     pid_payload = daemon_pid_payload()
-    state_payload = read_json(DAEMON_STATE_FILE, tolerate_empty=True, tolerate_invalid=True) or {}
+    state_payload = read_daemon_state_payload(pid_payload)
     pid = int(pid_payload.get("pid", 0) or 0) if pid_payload else 0
     return {
         "running": bool(pid_payload and process_alive(pid)),
@@ -1135,12 +1393,27 @@ def ensure_git_worktree(repo_top: str, lane_id: str, task_id: str) -> Path:
     if workspace.exists():
         return workspace
     workspace.parent.mkdir(parents=True, exist_ok=True)
+    add_command = ["git", "-C", repo_top, "worktree", "add", "--detach", str(workspace), "HEAD"]
     result = subprocess.run(
-        ["git", "-C", repo_top, "worktree", "add", "--detach", str(workspace), "HEAD"],
+        add_command,
         capture_output=True,
         text=True,
         check=False,
     )
+    failure_text = "\n".join(part for part in (result.stderr.strip(), result.stdout.strip()) if part)
+    if result.returncode != 0 and "missing but already registered worktree" in failure_text:
+        subprocess.run(
+            ["git", "-C", repo_top, "worktree", "prune"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        result = subprocess.run(
+            add_command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip() or "git worktree add failed"
         raise LaneExecutionError(message)
@@ -2518,6 +2791,9 @@ def execution_state(snapshot: dict[str, Any]) -> tuple[str, str]:
     tasks = snapshot.get("tasks") or []
     if not tasks:
         return "IDLE", "no tasks"
+    guard = snapshot.get("resilience_guard") or {}
+    if guard.get("active"):
+        return "PAUSED", str(guard.get("reason") or "resilience guard paused codex work")
 
     states = [task_display_state(task, snapshot) for task in tasks]
     if any(state == "RUNNING" for state, _reason in states):
@@ -2536,6 +2812,22 @@ def execution_state(snapshot: dict[str, Any]) -> tuple[str, str]:
     if snapshot.get("summary", {}).get("task_in_progress", 0) and not daemon.get("running", False):
         return "PAUSED", "tasks exist but the daemon is not running"
     return "WAITING", "tasks are queued or waiting on the next transition"
+
+
+def lane_display_state(lane: dict[str, Any]) -> str:
+    active_run = lane.get("active_run") or {}
+    if active_run and active_run.get("status") == "running":
+        return "RUNNING"
+    status = str(lane.get("status") or "")
+    if status == "error":
+        return "BLOCKED"
+    if status in {"assigned", "retrying"}:
+        return "RUNNING"
+    if status in {"waiting_eval", "locked"}:
+        return "WAITING"
+    if status == "idle":
+        return "IDLE"
+    return "WAITING"
 
 
 def task_active_summary(task: dict[str, Any], snapshot: dict[str, Any]) -> str:
@@ -2582,8 +2874,9 @@ def format_progress_stream(snapshot: dict[str, Any], task_id: str | None) -> str
     execution_reason = snapshot.get("execution_reason")
     if not execution_label or not execution_reason:
         execution_label, execution_reason = execution_state(snapshot)
+    phase = current_animation_phase()
 
-    lines = ["Progress:", f"- Execution: {execution_label} | {execution_reason}"]
+    lines = ["Progress:", f"- Execution: {render_state_label(execution_label, phase=phase)} | {execution_reason}"]
     if not visible_tasks:
         lines.append("- no tasks in progress")
         return "\n".join(lines)
@@ -2593,8 +2886,8 @@ def format_progress_stream(snapshot: dict[str, Any], task_id: str | None) -> str
         state_reason = task.get("display_reason")
         if not state_label or not state_reason:
             state_label, state_reason = task_display_state(task, snapshot)
-        lines.append(f"- {task['task_id']} [{state_label}] {task_stage_label(task)}")
-        lines.append(f"  state: {state_label} | {state_reason}")
+        lines.append(f"- {task['task_id']} [{render_state_label(state_label, phase=phase)}] {task_stage_label(task)}")
+        lines.append(f"  state: {render_state_label(state_label, phase=phase)} | {state_reason}")
         lines.append(f"  next: {task_next_action(task, snapshot)}")
         active = task_active_summary(task, snapshot)
         if active != "-":
@@ -2607,6 +2900,8 @@ def format_progress_stream(snapshot: dict[str, Any], task_id: str | None) -> str
 
 
 def status_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+    resilience = resilience_summary()
+    resilience_guard = resilience_guard_snapshot(resilience)
     ready_eval_tasks = [item["task"]["task_id"] for item in ready_evaluation_candidates(conn)]
     lanes = []
     for row in conn.execute("SELECT * FROM lanes ORDER BY lane_id ASC").fetchall():
@@ -2642,6 +2937,8 @@ def status_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
         "db_path": str(DB_PATH),
         "executor": DEFAULT_EXECUTOR,
         "daemon": daemon_runtime_snapshot(),
+        "resilience": resilience,
+        "resilience_guard": resilience_guard,
         "summary": summary,
         "lanes": lanes,
         "tasks": tasks,
@@ -2698,6 +2995,8 @@ def dashboard_snapshot(
     }
     execution_snapshot = {
         "daemon": daemon,
+        "resilience": base.get("resilience"),
+        "resilience_guard": base.get("resilience_guard"),
         "summary": summary,
         "lanes": base["lanes"],
         "tasks": tasks,
@@ -2714,6 +3013,8 @@ def dashboard_snapshot(
         "executor": base["executor"],
         "generated_at": now_utc(),
         "daemon": daemon,
+        "resilience": base.get("resilience"),
+        "resilience_guard": base.get("resilience_guard"),
         "execution_state": execution_label,
         "execution_reason": execution_reason,
         "summary": summary,
@@ -5070,7 +5371,17 @@ def run_evaluator_once(conn: sqlite3.Connection, executor: str, exec_timeout: fl
         return {"type": "evaluation_error", "task_id": task["task_id"], "error": str(exc)}
 
 
-def run_tick(conn: sqlite3.Connection, executor: str, exec_timeout: float) -> list[dict[str, Any]]:
+def run_tick(
+    conn: sqlite3.Connection,
+    executor: str,
+    exec_timeout: float,
+    *,
+    resilience_guard: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if executor == "codex":
+        guard = resilience_guard or resilience_execution_guard()
+        if guard.get("active"):
+            return []
     actions: list[dict[str, Any]] = []
     rebalance_waiting_worker_lanes(conn)
     promote_idle_lanes(conn)
@@ -5109,6 +5420,7 @@ def daemon_state_payload(
     reason: str,
     last_actions: list[dict[str, Any]] | None = None,
     quota_monitor: dict[str, Any] | None = None,
+    resilience_guard: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "pid": os.getpid(),
@@ -5118,21 +5430,32 @@ def daemon_state_payload(
         "started_at": started_at,
         "last_heartbeat": last_heartbeat,
         "last_progress": last_progress,
+        "last_progress_at": last_heartbeat if last_progress else None,
         "runnable_after": runnable_after,
         "stop_requested": stop_requested,
         "reason": reason,
-        "last_actions": last_actions or [],
-        "quota_monitor": quota_monitor or {},
+        "last_actions": compact_daemon_actions(last_actions),
+        "quota_monitor": compact_quota_monitor(quota_monitor),
+        "resilience_guard": compact_daemon_state_payload({"resilience_guard": resilience_guard or {}}).get("resilience_guard", {}),
     }
 
 
 def format_status(snapshot: dict[str, Any], task_id: str | None) -> str:
     lines: list[str] = []
     execution_label, execution_reason = execution_state(snapshot)
+    phase = current_animation_phase()
+    resilience = snapshot.get("resilience") or resilience_summary()
+    resilience_guard = snapshot.get("resilience_guard") or resilience_guard_snapshot(resilience)
     lines.append(f"Root: {snapshot['root']}")
     lines.append(f"DB: {snapshot['db_path']}")
     lines.append(f"Executor: {snapshot['executor']}")
-    lines.append(f"Execution: {execution_label} | {execution_reason}")
+    lines.append(f"Execution: {render_state_label(execution_label, phase=phase)} | {execution_reason}")
+    lines.append(
+        f"Resilience: auto_switch={'on' if resilience.get('auto_switch') else 'off'} "
+        f"selected={resilience_current_label(resilience)} reserve_threshold={resilience.get('reserve_percent_threshold', '-')}"
+    )
+    if resilience_guard.get("active"):
+        lines.append(f"Resilience guard: {render_state_label('PAUSED', phase=phase)} | {resilience_guard.get('reason')}")
     lines.append("")
     lines.append("Lanes:")
     for lane in snapshot["lanes"]:
@@ -5140,8 +5463,10 @@ def format_status(snapshot: dict[str, Any], task_id: str | None) -> str:
             f"{entry['task_id']}:{entry['reservation_type']}" for entry in lane["queued_reservations"]
         ) or "-"
         notes = lane["notes"] or "-"
+        lane_state = lane_display_state(lane)
         lines.append(
-            f"- {lane['lane_id']}: status={lane['status']} active_task={lane['active_task_id'] or '-'} "
+            f"- {lane['lane_id']}: state={render_state_label(lane_state, phase=phase)} raw_status={lane['status']} "
+            f"active_task={lane['active_task_id'] or '-'} "
             f"active_submission={lane['active_submission_id'] or '-'} active_run={lane['active_run_id'] or '-'} "
             f"queue={queue_desc} notes={notes}"
         )
@@ -5153,12 +5478,13 @@ def format_status(snapshot: dict[str, Any], task_id: str | None) -> str:
     for task in tasks:
         display_state, display_reason = task_display_state(task, snapshot)
         lines.append(
-            f"- {task['task_id']}: status={task['status']} champion={lane_display_name(task['champion_lane_id']) if task['champion_lane_id'] else '-'} "
+            f"- {task['task_id']}: status={task['status']} display={render_state_label(display_state, phase=phase)} "
+            f"champion={lane_display_name(task['champion_lane_id']) if task['champion_lane_id'] else '-'} "
             f"published={task['published_submission_id'] or '-'} retries={task['challenger_failed_attempts']} "
             f"evals={task['total_evaluations']} swaps={task['role_swaps']} masterpiece={bool(task['masterpiece_locked'])} "
             f"pair_mode={task.get('pair_mode')} judge={evaluator_display_label(task.get('evaluator_tier'))}"
         )
-        lines.append(f"  state: {display_state} | {display_reason}")
+        lines.append(f"  state: {render_state_label(display_state, phase=phase)} | {display_reason}")
     if not tasks:
         lines.append("- none")
     return "\n".join(lines)
@@ -5168,10 +5494,13 @@ def format_dashboard(snapshot: dict[str, Any]) -> str:
     lines: list[str] = []
     daemon_state = snapshot["daemon"].get("state") or {}
     quota_monitor = daemon_state.get("quota_monitor") or {}
+    resilience = snapshot.get("resilience") or resilience_summary()
+    resilience_guard = snapshot.get("resilience_guard") or resilience_guard_snapshot(resilience)
     execution_label = snapshot.get("execution_state")
     execution_reason = snapshot.get("execution_reason")
     if not execution_label or not execution_reason:
         execution_label, execution_reason = execution_state(snapshot)
+    phase = current_animation_phase()
     lines.append("CodexLab Dashboard")
     lines.append(f"Root: {snapshot['root']}")
     lines.append(f"Updated: {snapshot.get('generated_at', '-')}")
@@ -5179,7 +5508,7 @@ def format_dashboard(snapshot: dict[str, Any]) -> str:
         f"Daemon: running={snapshot['daemon']['running']} reason={daemon_state.get('reason', '-')} "
         f"cycle_count={daemon_state.get('cycle_count', '-')}"
     )
-    lines.append(f"Execution: {execution_label} | {execution_reason}")
+    lines.append(f"Execution: {render_state_label(execution_label, phase=phase)} | {execution_reason}")
     summary = snapshot["summary"]
     lines.append(
         "Summary: "
@@ -5203,6 +5532,13 @@ def format_dashboard(snapshot: dict[str, Any]) -> str:
                 f"Quota detail: at={quota_monitor.get('last_probe_at', '-')} "
                 f"message={probe.get('message', '-')}"
             )
+    lines.append(
+        f"Resilience: auto_switch={'on' if resilience.get('auto_switch') else 'off'} "
+        f"selected={resilience_current_label(resilience)} "
+        f"reserve_threshold={resilience.get('reserve_percent_threshold', '-')}"
+    )
+    if resilience_guard.get("active"):
+        lines.append(f"Resilience guard: {render_state_label('PAUSED', phase=phase)} | {resilience_guard.get('reason')}")
     lines.append("")
     lines.append("Corners and Officials:")
     for lane in snapshot["lanes"]:
@@ -5215,8 +5551,10 @@ def format_dashboard(snapshot: dict[str, Any]) -> str:
                 f"started={active_run['started_at']}"
             )
         lane_role = lane_display_name(lane["lane_id"])
+        lane_state = lane_display_state(lane)
         lines.append(
-            f"- {lane_role}: status={lane['status']} active_task={lane['active_task_id'] or '-'} "
+            f"- {lane_role}: {render_state_label(lane_state, phase=phase)} raw_status={lane['status']} "
+            f"active_task={lane['active_task_id'] or '-'} "
             f"active_submission={lane['active_submission_id'] or '-'} run={run_desc}"
         )
         lines.append(f"  Queue: {queue_desc}")
@@ -5239,13 +5577,14 @@ def format_dashboard(snapshot: dict[str, Any]) -> str:
             if not display_state or not display_reason:
                 display_state, display_reason = task_display_state(task, snapshot)
             lines.append(
-                f"- {task['task_id']}: {status_label} champion={lane_display_name(task['champion_lane_id']) if task['champion_lane_id'] else '-'} "
+                f"- {task['task_id']}: {render_state_label(display_state, phase=phase)} {status_label} "
+                f"champion={lane_display_name(task['champion_lane_id']) if task['champion_lane_id'] else '-'} "
                 f"challenger={lane_display_name(task['challenger_lane_id']) if task['challenger_lane_id'] else '-'} evals={task['total_evaluations']} "
                 f"retries={task['challenger_failed_attempts']} swaps={task['role_swaps']}"
             )
             lines.append(f"  Prompt: {task['prompt_preview']}")
             lines.append(f"  Stage: {task_stage_label(task)}")
-            lines.append(f"  State: {display_state} | {display_reason}")
+            lines.append(f"  State: {render_state_label(display_state, phase=phase)} | {display_reason}")
             lines.append(
                 f"  Resolution: duel_stage={task.get('duel_stage')} pair_mode={task.get('pair_mode')} "
                 f"judge={evaluator_display_label(task.get('evaluator_tier'))} tier_phase={task.get('tier_phase')}"
@@ -5573,7 +5912,9 @@ def cmd_daemon_run(args: argparse.Namespace) -> int:
     stop_requested = False
     started_at = now_utc()
     cycle_count = 0
-    quota_monitor_state = (read_json(DAEMON_STATE_FILE, tolerate_empty=True, tolerate_invalid=True) or {}).get("quota_monitor") or {}
+    previous_state = read_daemon_state_payload()
+    quota_monitor_state = previous_state.get("quota_monitor") or {}
+    resilience_guard_state = previous_state.get("resilience_guard") or {}
 
     def handle_stop(_signum: int, _frame: Any) -> None:
         nonlocal stop_requested
@@ -5597,22 +5938,49 @@ def cmd_daemon_run(args: argparse.Namespace) -> int:
         while True:
             conn = connect()
             auto_recover_action: dict[str, Any] | None = None
-            quota_monitor_state, auto_recover_action = daemon_quota_monitor(
-                conn,
-                executor=args.executor,
-                exec_timeout=args.exec_timeout,
-                previous=quota_monitor_state,
+            refresh_guard = False
+            if args.executor == "codex":
+                checked_at = parse_timestamp(resilience_guard_state.get("checked_at"))
+                now = datetime.now(timezone.utc)
+                refresh_guard = (
+                    bool(resilience_guard_state.get("active"))
+                    and (
+                    checked_at is None
+                    or (now - checked_at).total_seconds() >= DEFAULT_RESILIENCE_RECHECK_INTERVAL
+                    )
+                )
+            resilience_guard_state = (
+                resilience_execution_guard(refresh_usage=refresh_guard)
+                if args.executor == "codex"
+                else {}
             )
-            tick_actions = run_tick(conn, args.executor, args.exec_timeout)
-            actions = ([auto_recover_action] if auto_recover_action else []) + tick_actions
+            if args.executor == "codex" and resilience_guard_state.get("active"):
+                tick_actions = []
+                actions = []
+                quota_monitor_state = compact_quota_monitor(quota_monitor_state)
+            else:
+                quota_monitor_state, auto_recover_action = daemon_quota_monitor(
+                    conn,
+                    executor=args.executor,
+                    exec_timeout=args.exec_timeout,
+                    previous=quota_monitor_state,
+                )
+                tick_actions = run_tick(
+                    conn,
+                    args.executor,
+                    args.exec_timeout,
+                    resilience_guard=resilience_guard_state,
+                )
+                actions = ([auto_recover_action] if auto_recover_action else []) + tick_actions
             runnable_after = has_runnable_work(conn)
-            snapshot = status_snapshot(conn)
             conn.close()
             cycle_count += 1
             heartbeat = now_utc()
             reason = "running"
             if stop_requested:
                 reason = "stop_requested"
+            elif args.executor == "codex" and resilience_guard_state.get("active"):
+                reason = "resilience_paused"
             elif args.until_idle and not runnable_after:
                 reason = "idle"
             elif args.max_cycles and cycle_count >= args.max_cycles:
@@ -5629,9 +5997,9 @@ def cmd_daemon_run(args: argparse.Namespace) -> int:
                 reason=reason,
                 last_actions=actions,
                 quota_monitor=quota_monitor_state,
+                resilience_guard=resilience_guard_state,
             )
             state["exec_timeout"] = args.exec_timeout
-            state["status_snapshot"] = snapshot
             write_json(DAEMON_STATE_FILE, state)
             append_event(
                 "daemon_tick",
@@ -5650,7 +6018,7 @@ def cmd_daemon_run(args: argparse.Namespace) -> int:
                 break
             time.sleep(args.interval)
     finally:
-        final_state = read_json(DAEMON_STATE_FILE, tolerate_empty=True, tolerate_invalid=True) or {}
+        final_state = read_daemon_state_payload()
         final_state.update(
             {
                 "pid": os.getpid(),
@@ -6146,7 +6514,11 @@ def cmd_recover(args: argparse.Namespace) -> int:
         if args.resume:
             daemon_state = snapshot["daemon"].get("state") or {}
             resume_executor = args.executor or daemon_state.get("executor") or DEFAULT_EXECUTOR
-            resume_timeout = args.exec_timeout if args.exec_timeout is not None else float(daemon_state.get("exec_timeout") or DEFAULT_EXEC_TIMEOUT)
+            resume_timeout = (
+                args.exec_timeout
+                if args.exec_timeout is not None
+                else max(float(daemon_state.get("exec_timeout") or 0.0), default_exec_timeout_for(resume_executor))
+            )
             resume_interval = args.interval if args.interval is not None else float(daemon_state.get("interval") or 0.0)
             resume_payload = resume_recovered_work(
                 conn,
@@ -6161,7 +6533,11 @@ def cmd_recover(args: argparse.Namespace) -> int:
         if args.restart_daemon:
             daemon_state = snapshot["daemon"].get("state") or {}
             restart_executor = args.executor or daemon_state.get("executor") or DEFAULT_EXECUTOR
-            restart_timeout = args.exec_timeout if args.exec_timeout is not None else float(daemon_state.get("exec_timeout") or DEFAULT_EXEC_TIMEOUT)
+            restart_timeout = (
+                args.exec_timeout
+                if args.exec_timeout is not None
+                else max(float(daemon_state.get("exec_timeout") or 0.0), default_exec_timeout_for(restart_executor))
+            )
             restart_interval = args.interval if args.interval is not None else float(daemon_state.get("interval") or 1.0)
             daemon_restart = start_daemon_process(
                 executor=restart_executor,
@@ -6410,11 +6786,12 @@ def format_console_snapshot(
     execution_reason = snapshot.get("execution_reason")
     if not execution_label or not execution_reason:
         execution_label, execution_reason = execution_state(snapshot)
+    phase = current_animation_phase()
 
     lines: list[str] = []
     focus_label = focus_task_id or "all"
     lines.append(f"CodexLab Console | focus={focus_label}")
-    lines.append(f"Execution: {execution_label} | {execution_reason}")
+    lines.append(f"Execution: {render_state_label(execution_label, phase=phase)} | {execution_reason}")
     summary = snapshot.get("summary", {})
     lines.append(
         "Summary: "
@@ -6443,11 +6820,15 @@ def format_console_snapshot(
             f"Quota monitor: status={quota_monitor.get('status', '-')} "
             f"email={identity.get('email') or '-'} blocked={blocked}"
         )
-    resilience = resilience_summary()
+    resilience = snapshot.get("resilience") or resilience_summary()
+    resilience_guard = snapshot.get("resilience_guard") or resilience_guard_snapshot(resilience)
     lines.append(
         f"Resilience: auto_switch={'on' if resilience.get('auto_switch') else 'off'} "
-        f"selected={resilience_current_label(resilience)}"
+        f"selected={resilience_current_label(resilience)} "
+        f"reserve_threshold={resilience.get('reserve_percent_threshold', '-')}"
     )
+    if resilience_guard.get("active"):
+        lines.append(f"Resilience guard: {render_state_label('PAUSED', phase=phase)} | {resilience_guard.get('reason')}")
     lines.append(f"Profiles: {resilience_counts_display(resilience.get('counts') or {})}")
     for profile in list(resilience.get("profiles") or [])[:4]:
         current_marker = " current" if profile.get("is_current") else ""
@@ -6464,8 +6845,10 @@ def format_console_snapshot(
         run_desc = "-"
         if active_run:
             run_desc = f"{active_run['run_id']} {active_run['mode']} {active_run['status']}"
+        lane_state = lane_display_state(lane)
         lines.append(
-            f"- {lane_display_name(lane['lane_id'])}: {lane['status']} task={lane['active_task_id'] or '-'} "
+            f"- {render_state_label(lane_state, phase=phase)} {lane_display_name(lane['lane_id'])}: "
+            f"raw_status={lane['status']} task={lane['active_task_id'] or '-'} "
             f"submission={lane['active_submission_id'] or '-'} run={run_desc} queue={queue_desc}"
         )
 
@@ -6487,9 +6870,9 @@ def format_console_snapshot(
             state_reason = task.get("display_reason")
             if not state_label or not state_reason:
                 state_label, state_reason = task_display_state(task, snapshot)
-            lines.append(f"- {task['task_id']} [{state_label}] {task_stage_label(task)}")
+            lines.append(f"- {task['task_id']} [{render_state_label(state_label, phase=phase)}] {task_stage_label(task)}")
             lines.append(f"  next: {task_next_action(task, snapshot)}")
-            lines.append(f"  state: {state_reason}")
+            lines.append(f"  state: {render_state_label(state_label, phase=phase)} | {state_reason}")
             lines.append(f"  crowd: {crowd_reaction(task)}")
             scoreboard = task_scoreboard_summary(task)
             if scoreboard != "-":
@@ -6727,21 +7110,54 @@ def probe_resilience_usage(*, all_profiles: bool) -> dict[str, Any]:
     else:
         current_key = payload.get("current_account_key")
         account_keys = [current_key] if current_key else []
+    jobs: list[tuple[str, dict[str, Any]]] = []
     for account_key in account_keys:
         if not account_key or account_key not in accounts:
             continue
         auth_data = accounts[account_key].get("auth_data")
-        if not isinstance(auth_data, dict) or not auth_data:
+        if isinstance(auth_data, dict) and auth_data:
+            jobs.append((account_key, auth_data))
+    if not jobs:
+        return vault.summary()
+
+    results: dict[str, dict[str, Any]] = {}
+    worker_count = usage_probe_worker_count(len(jobs))
+    if worker_count <= 1:
+        for account_key, auth_data in jobs:
+            try:
+                results[account_key] = probe_auth_rate_limits(
+                    auth_data,
+                    codex_bin=REAL_CODEX,
+                    scratch_root=RESILIENCE_SCRATCH_DIR,
+                    timeout_seconds=8.0,
+                )
+            except Exception:
+                continue
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    probe_auth_rate_limits,
+                    auth_data,
+                    codex_bin=REAL_CODEX,
+                    scratch_root=RESILIENCE_SCRATCH_DIR,
+                    timeout_seconds=8.0,
+                ): account_key
+                for account_key, auth_data in jobs
+            }
+            for future in concurrent.futures.as_completed(futures):
+                account_key = futures[future]
+                try:
+                    results[account_key] = future.result()
+                except Exception:
+                    continue
+    for account_key, _auth_data in jobs:
+        usage_summary = results.get(account_key)
+        if usage_summary is None:
             continue
         try:
-            usage_summary = probe_auth_rate_limits(
-                auth_data,
-                codex_bin=REAL_CODEX,
-                scratch_root=RESILIENCE_SCRATCH_DIR,
-                timeout_seconds=8.0,
-            )
             vault.record_usage_probe(account_key, usage_summary)
-        except VaultError:
+        except Exception:
             continue
     return vault.summary()
 
@@ -6783,14 +7199,15 @@ def handle_resilience_console_command(
     try:
         if cmd_name == "/profile":
             if len(parts) < 2:
-                return "usage: /profile register <alias> | list | current | activate <account> | disable <account> | enable <account> | reset-exhausted"
+                return "usage: /profile register [alias] | list | current | activate <account> | disable <account> | enable <account> | renumber | reset-exhausted"
             action = parts[1]
             if action == "register":
-                if len(parts) < 3:
-                    return "usage: /profile register <alias>"
+                if len(parts) > 3:
+                    return "usage: /profile register [alias]"
                 if not allow_profile_login:
                     return "/profile register is only available in the shell-style console"
-                account_key = run_resilience_profile_login(parts[2])
+                alias = parts[2] if len(parts) == 3 else None
+                account_key = run_resilience_profile_login(alias)
                 return f"registered {account_key}"
             if action == "list":
                 print_resilience_profiles(vault.summary())
@@ -6821,6 +7238,9 @@ def handle_resilience_console_command(
                 resolved_key = vault.resolve_account_ref(parts[2])
                 vault.enable(resolved_key)
                 return f"enabled {resolved_key}"
+            if action == "renumber":
+                mapping = vault.renumber_aliases()
+                return f"renumbered profiles={len(mapping)}"
             if action == "reset-exhausted":
                 changed = vault.reset_exhausted()
                 return f"reset exhausted profiles={changed}"
@@ -6896,10 +7316,10 @@ def handle_console_command(
 def cmd_console(args: argparse.Namespace) -> int:
     ensure_layout()
     focus_task_id = args.task_id
-    injected_profile = ensure_selected_resilience_profile()
+    selected_profile = resilience_summary().get("current_account_key")
     status_message = (
-        f"profile {injected_profile} loaded | type a task and press Enter"
-        if injected_profile
+        f"profile {selected_profile} ready | type a task and press Enter"
+        if selected_profile
         else "type a task and press Enter"
     )
     live_panel_mode = advanced_prompt_available()
@@ -7181,7 +7601,7 @@ def build_parser() -> argparse.ArgumentParser:
     console = subparsers.add_parser("console", help="Open the shell-style dashboard + prompt console")
     console.add_argument("--task-id")
     console.add_argument("--executor", choices=("mock", "codex"), default=LIVE_DEFAULT_EXECUTOR)
-    console.add_argument("--exec-timeout", type=float, default=DEFAULT_EXEC_TIMEOUT)
+    console.add_argument("--exec-timeout", type=float, default=default_exec_timeout_for(LIVE_DEFAULT_EXECUTOR))
     console.add_argument("--interval", type=float, default=DEFAULT_WATCH_INTERVAL)
     console.add_argument("--events-limit", type=int, default=DEFAULT_EVENTS_LIMIT)
     console.set_defaults(func=cmd_console)
@@ -7190,7 +7610,7 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--title")
     live.add_argument("--prompt")
     live.add_argument("--executor", choices=("mock", "codex"), default=LIVE_DEFAULT_EXECUTOR)
-    live.add_argument("--exec-timeout", type=float, default=DEFAULT_EXEC_TIMEOUT)
+    live.add_argument("--exec-timeout", type=float, default=default_exec_timeout_for(LIVE_DEFAULT_EXECUTOR))
     live.add_argument("--interval", type=float, default=DEFAULT_WATCH_INTERVAL)
     live.add_argument("--events-limit", type=int, default=DEFAULT_EVENTS_LIMIT)
     live.add_argument("--dashboard", action="store_true", help="Use the full screen dashboard instead of the event stream")
@@ -7228,13 +7648,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     tick = subparsers.add_parser("tick", help="Execute one scheduler tick")
     tick.add_argument("--executor", choices=("mock", "codex"), default=DEFAULT_EXECUTOR)
-    tick.add_argument("--exec-timeout", type=float, default=DEFAULT_EXEC_TIMEOUT)
+    tick.add_argument("--exec-timeout", type=float, default=default_exec_timeout_for(DEFAULT_EXECUTOR))
     tick.add_argument("--json", action="store_true")
     tick.set_defaults(func=cmd_tick)
 
     run_loop = subparsers.add_parser("run-loop", help="Run the scheduler for multiple ticks")
     run_loop.add_argument("--executor", choices=("mock", "codex"), default=DEFAULT_EXECUTOR)
-    run_loop.add_argument("--exec-timeout", type=float, default=DEFAULT_EXEC_TIMEOUT)
+    run_loop.add_argument("--exec-timeout", type=float, default=default_exec_timeout_for(DEFAULT_EXECUTOR))
     run_loop.add_argument("--interval", type=float, default=0.0)
     run_loop.add_argument("--max-ticks", type=int, default=20)
     run_loop.add_argument("--until-idle", action="store_true")
@@ -7246,7 +7666,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     daemon_run = daemon_subparsers.add_parser("run", help="Run the scheduler in the foreground")
     daemon_run.add_argument("--executor", choices=("mock", "codex"), default=DEFAULT_EXECUTOR)
-    daemon_run.add_argument("--exec-timeout", type=float, default=DEFAULT_EXEC_TIMEOUT)
+    daemon_run.add_argument("--exec-timeout", type=float, default=default_exec_timeout_for(DEFAULT_EXECUTOR))
     daemon_run.add_argument("--interval", type=float, default=1.0)
     daemon_run.add_argument("--max-cycles", type=int, default=0)
     daemon_run.add_argument("--until-idle", action="store_true")
@@ -7255,7 +7675,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     daemon_start = daemon_subparsers.add_parser("start", help="Start the scheduler in the background")
     daemon_start.add_argument("--executor", choices=("mock", "codex"), default=DEFAULT_EXECUTOR)
-    daemon_start.add_argument("--exec-timeout", type=float, default=DEFAULT_EXEC_TIMEOUT)
+    daemon_start.add_argument("--exec-timeout", type=float, default=default_exec_timeout_for(DEFAULT_EXECUTOR))
     daemon_start.add_argument("--interval", type=float, default=1.0)
     daemon_start.add_argument("--max-cycles", type=int, default=0)
     daemon_start.add_argument("--until-idle", action="store_true")
@@ -7342,7 +7762,7 @@ def build_parser() -> argparse.ArgumentParser:
     tui = subparsers.add_parser("tui", help="Open the full-screen curses dashboard + prompt console")
     tui.add_argument("--task-id")
     tui.add_argument("--executor", choices=("mock", "codex"), default=LIVE_DEFAULT_EXECUTOR)
-    tui.add_argument("--exec-timeout", type=float, default=DEFAULT_EXEC_TIMEOUT)
+    tui.add_argument("--exec-timeout", type=float, default=default_exec_timeout_for(LIVE_DEFAULT_EXECUTOR))
     tui.add_argument("--interval", type=float, default=DEFAULT_WATCH_INTERVAL)
     tui.add_argument("--events-limit", type=int, default=DEFAULT_EVENTS_LIMIT)
     tui.set_defaults(func=cmd_tui)

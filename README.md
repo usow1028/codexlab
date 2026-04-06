@@ -171,7 +171,7 @@ Task artifacts now also generate readable boxing companion files beside the cano
 - the shell-style console intentionally leaves the input line bare instead of printing `Prompt>` inline, to reduce IME composition interference.
 - when that prompt path is active, typing `/` now opens a live slash-command completion list, and the menu narrows immediately as you keep typing.
 - resilience profile state now lives in `~/.codexlab/pool.json` by default. When a current profile is selected, `codexlab` injects that profile back into `~/.codex/auth.json` before live work starts.
-- `/profile register <alias>` now launches `codex login` inside the same terminal, then captures the resulting `~/.codex/auth.json` into the vault and marks that profile current.
+- `/profile register` now launches `codex login` inside the same terminal, then captures the resulting `~/.codex/auth.json` into the vault and marks that profile current with the next numbered alias (`1`, `2`, `3`, ...). You can still pass an optional alias override.
 - `/profile activate <account_key|alias>` switches the selected stored profile back into `~/.codex/auth.json` immediately.
 - `/auto-switch on|off` and `/run ...` keep using the same quota-aware account rotation layer.
 - `/useage` probes the current profile's live Codex weekly limit and prints a compact `email + remaining percent` summary.

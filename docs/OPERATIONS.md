@@ -49,7 +49,7 @@ codexlab runs show RUN-0001
 - the shell-style console accepts plain task text plus `/focus T-0001`, `/all`, `/refresh`, `/clear-tasks`, `/profile ...`, `/auto-switch on|off`, `/sync`, `/run ...`, and `/quit`.
 - plain text in that prompt submits a new task immediately; only slash-prefixed entries are treated as console commands.
 - resilience profile data is stored in `~/.codexlab/pool.json` by default. When a current profile exists, `codexlab` injects it back into `~/.codex/auth.json` before live work starts.
-- `/profile register <alias>` launches `codex login` in the same terminal, then stores the resulting `~/.codex/auth.json` as a named profile and marks it current.
+- `/profile register` launches `codex login` in the same terminal, then stores the resulting `~/.codex/auth.json` as the next numbered profile alias and marks it current. An explicit alias override is still accepted when needed.
 - `/profile list` shows the vault, `/profile activate <account_key|alias>` switches manually, `/auto-switch on|off` controls quota-triggered rotation, and `/sync` writes refreshed tokens back into the vault.
 - `/useage` probes the current profile's live Codex weekly limit and prints a compact `email + remaining percent` summary.
 - `/useage all` runs the same live probe for every stored profile in isolation and prints the same compact weekly-limit summary for each profile.

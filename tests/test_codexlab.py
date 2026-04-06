@@ -497,6 +497,39 @@ raise SystemExit(int(entry.get("exit_code", 0)))
         args = parser.parse_args(["tui"])
         self.assertIs(args.func, module.cmd_tui)
 
+    def test_build_parser_uses_executor_specific_timeout_defaults(self) -> None:
+        module = self.load_module()
+        parser = module.build_parser()
+        console_args = parser.parse_args(["console"])
+        tick_args = parser.parse_args(["tick"])
+        self.assertEqual(console_args.exec_timeout, module.DEFAULT_CODEX_EXEC_TIMEOUT)
+        self.assertEqual(tick_args.exec_timeout, module.DEFAULT_MOCK_EXEC_TIMEOUT)
+
+    def test_ensure_git_worktree_prunes_missing_registered_entry_and_retries(self) -> None:
+        module = self.load_module()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "worktrees" / "T-0001"
+            failure = subprocess.CompletedProcess(
+                args=["git"],
+                returncode=128,
+                stdout="",
+                stderr=(
+                    f"fatal: '{workspace}' is a missing but already registered worktree;\n"
+                    "use 'add -f' to override, or 'prune' or 'remove' to clear"
+                ),
+            )
+            prune = subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr="")
+            success = subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr="")
+            with mock.patch.object(module, "worktree_workspace_path", return_value=workspace), mock.patch.object(
+                module.subprocess, "run", side_effect=[failure, prune, success]
+            ) as run_mock:
+                result = module.ensure_git_worktree("/tmp/repo", "worker-a", "T-0001")
+            self.assertEqual(result, workspace)
+            commands = [call.args[0] for call in run_mock.call_args_list]
+            self.assertEqual(commands[0][:5], ["git", "-C", "/tmp/repo", "worktree", "add"])
+            self.assertEqual(commands[1], ["git", "-C", "/tmp/repo", "worktree", "prune"])
+            self.assertEqual(commands[2][:5], ["git", "-C", "/tmp/repo", "worktree", "add"])
+
     def test_read_prompt_line_uses_prompt_session_when_available(self) -> None:
         module = self.load_module()
         module.PROMPT_SESSIONS.clear()
@@ -537,7 +570,7 @@ raise SystemExit(int(entry.get("exit_code", 0)))
         completer = module.CONSOLE_SLASH_COMPLETER
         self.assertIsNotNone(completer)
         slash_matches = [item.text for item in completer.get_completions(mock.Mock(text_before_cursor="/"), None)]
-        self.assertIn("/profile register <alias>", slash_matches)
+        self.assertIn("/profile register", slash_matches)
         self.assertIn("/auto-switch on", slash_matches)
         self.assertIn("/useage", slash_matches)
         self.assertIn("/useage all", slash_matches)
@@ -624,6 +657,39 @@ raise SystemExit(int(entry.get("exit_code", 0)))
                 rotated_auth = json.loads((login_home / "auth.json").read_text(encoding="utf-8"))
                 self.assertEqual(rotated_auth["tokens"]["account_id"], "acc-beta")
 
+    def test_resilience_vault_usage_probe_updates_rotation_eligibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            ):
+                module = self.load_module()
+                vault = module.credential_vault()
+                vault.register_current("alpha")
+                self.write_fake_auth(login_home, email="beta@example.com", account_id="acc-beta")
+                vault.register_current("beta")
+                self.write_fake_auth(login_home, email="gamma@example.com", account_id="acc-gamma")
+                vault.register_current("gamma")
+                vault.activate("account_1")
+
+                vault.record_usage_probe("account_2", {"used_percent": 100.0, "remaining_percent": 0.0})
+                vault.record_usage_probe("account_3", {"used_percent": 76.0, "remaining_percent": 24.0})
+                rotated_to = vault.rotate_account(reason="quota exceeded")
+                self.assertEqual(rotated_to, "account_3")
+
+                vault.record_usage_probe("account_2", {"used_percent": 20.0, "remaining_percent": 80.0})
+                summary = vault.summary()
+                account_2 = next(item for item in summary["profiles"] if item["account_key"] == "account_2")
+                self.assertEqual(account_2["status"], "ready")
+
     def test_resilient_runner_rotates_on_quota_text_and_retries(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -683,6 +749,65 @@ print(f"ok:{account_id}", flush=True)
                 self.assertEqual(result.rotations[0].next_account_key, "account_1")
                 self.assertEqual(vault.current_account_key(), "account_1")
 
+    def test_resilient_runner_tries_all_ready_profiles_before_giving_up(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            script_path = root / "quota-runner-many.py"
+            script_path.write_text(
+                """#!/usr/bin/env python3
+from __future__ import annotations
+import json
+import os
+import sys
+from pathlib import Path
+
+auth = json.loads(Path(os.environ["CODEXLAB_AUTH_PATH"]).read_text(encoding="utf-8"))
+account_id = auth["tokens"]["account_id"]
+if account_id != "acc-delta":
+    print("429 Rate limit", file=sys.stderr, flush=True)
+    raise SystemExit(1)
+print(f"ok:{account_id}", flush=True)
+""",
+                encoding="utf-8",
+            )
+            script_path.chmod(0o755)
+
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            ):
+                module = self.load_module()
+                vault = module.credential_vault()
+                vault.register_current("alpha")
+                self.write_fake_auth(login_home, email="beta@example.com", account_id="acc-beta")
+                vault.register_current("beta")
+                self.write_fake_auth(login_home, email="gamma@example.com", account_id="acc-gamma")
+                vault.register_current("gamma")
+                self.write_fake_auth(login_home, email="delta@example.com", account_id="acc-delta")
+                vault.register_current("delta")
+                vault.activate("account_1")
+
+                env = os.environ.copy()
+                env["CODEXLAB_AUTH_PATH"] = str(login_home / "auth.json")
+                result = module.ResilientRunner(vault).execute(
+                    ["python3", str(script_path)],
+                    auto_switch=True,
+                    env=env,
+                )
+
+                self.assertEqual(result.completed.returncode, 0)
+                self.assertEqual(result.completed.stdout.strip(), "ok:acc-delta")
+                self.assertEqual(result.attempts, 4)
+                self.assertEqual(len(result.rotations), 3)
+                self.assertEqual(vault.current_account_key(), "account_4")
+
     def test_resilience_console_commands_manage_profiles_and_run_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -705,7 +830,7 @@ print(f"ok:{account_id}", flush=True)
                     return subprocess.CompletedProcess(argv, 0, "", "")
 
                 with mock.patch.object(module.subprocess, "run", side_effect=fake_login_run):
-                    registered = module.handle_resilience_console_command("/profile register alpha")
+                    registered = module.handle_resilience_console_command("/profile register")
                 self.assertEqual(registered, "registered account_1")
 
                 list_output = io.StringIO()
@@ -713,7 +838,7 @@ print(f"ok:{account_id}", flush=True)
                     list_status = module.handle_resilience_console_command("/profile list")
                 self.assertEqual(list_status, "profiles=1")
                 self.assertIn("account_1", list_output.getvalue())
-                self.assertIn("alias=alpha", list_output.getvalue())
+                self.assertIn("alias=1", list_output.getvalue())
 
                 self.assertEqual(module.handle_resilience_console_command("/auto-switch off"), "auto-switch=off")
                 self.assertEqual(module.handle_resilience_console_command("/auto-switch on"), "auto-switch=on")
@@ -878,6 +1003,71 @@ print(f"ok:{account_id}", flush=True)
                 self.assertIn("Resilience: auto_switch=on selected=account_1/alpha", rendered)
                 self.assertIn("Profiles: ready=0 active=1 exhausted=0 disabled=0", rendered)
 
+    def test_format_console_snapshot_renders_ascii_state_icons(self) -> None:
+        module = self.load_module()
+        snapshot = {
+            "execution_state": "RUNNING",
+            "execution_reason": "red corner is drafting",
+            "summary": {
+                "task_total": 1,
+                "task_in_progress": 1,
+                "queued_reservations": 0,
+                "ready_evaluations": 0,
+                "repairable_lanes": 0,
+            },
+            "daemon": {"running": True, "state": {"executor": "codex", "reason": "running"}},
+            "executor": "codex",
+            "lanes": [
+                {
+                    "lane_id": "worker-a",
+                    "status": "assigned",
+                    "active_task_id": "T-0001",
+                    "active_submission_id": None,
+                    "active_run": {
+                        "run_id": "RUN-0001",
+                        "mode": "codex:worker",
+                        "status": "running",
+                    },
+                    "queued_reservations": [],
+                }
+            ],
+            "tasks": [
+                {
+                    "task_id": "T-0001",
+                    "status": "in_progress",
+                    "display_state": "RUNNING",
+                    "display_reason": "red corner is drafting",
+                    "prompt_preview": "Draft something durable",
+                    "masterpiece_locked": 0,
+                    "pair_mode": "initial_duel",
+                    "evaluator_tier": "primary",
+                    "tier_phase": "base",
+                    "duel_stage": "initial",
+                    "champion_lane_id": None,
+                    "challenger_lane_id": None,
+                    "champion_submission": None,
+                    "challenger_submission": None,
+                    "latest_evaluation": None,
+                    "rematch_brief": "",
+                    "queued_on_lanes": [],
+                    "scoreboard": [],
+                    "total_evaluations": 0,
+                    "challenger_failed_attempts": 0,
+                    "role_swaps": 0,
+                }
+            ],
+            "recent_events": [],
+        }
+        with mock.patch.object(module, "current_animation_phase", return_value=0), mock.patch.object(
+            module,
+            "resilience_summary",
+            return_value={"auto_switch": True, "profiles": [], "counts": {"ready": 0, "active": 0, "exhausted": 0, "disabled": 0}},
+        ):
+            rendered = module.format_console_snapshot(snapshot, focus_task_id=None)
+        self.assertIn("Execution: | RUNNING | red corner is drafting", rendered)
+        self.assertIn("- | RUNNING Red Corner: raw_status=assigned", rendered)
+        self.assertIn("- T-0001 [| RUNNING] Waiting for the corners", rendered)
+
     def test_daemon_status_tolerates_empty_state_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -887,6 +1077,322 @@ print(f"ok:{account_id}", flush=True)
             payload = json.loads(self.run_cli(root, "daemon", "status", "--json").stdout)
             self.assertFalse(payload["running"])
             self.assertEqual(payload["state"], {})
+
+    def test_daemon_runtime_snapshot_compacts_oversized_state_file_when_not_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            daemon_dir = root / "control" / "daemon"
+            daemon_dir.mkdir(parents=True, exist_ok=True)
+            oversized_payload = {
+                "pid": 0,
+                "executor": "codex",
+                "reason": "looping",
+                "status_snapshot": {
+                    "daemon": {
+                        "state": {
+                            "status_snapshot": {
+                                "daemon": {
+                                    "state": {
+                                        "status_snapshot": {"nested": True}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+            state_file = daemon_dir / "daemon-state.json"
+            state_file.write_text(json.dumps(oversized_payload, indent=2, ensure_ascii=True), encoding="utf-8")
+            self.assertGreater(state_file.stat().st_size, 64)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_MAX_DAEMON_STATE_FILE_BYTES": "64",
+                },
+            ):
+                module = self.load_module()
+                snapshot = module.daemon_runtime_snapshot()
+                self.assertFalse(snapshot["running"])
+                self.assertTrue(snapshot["state"]["state_compacted"])
+                self.assertEqual(snapshot["state"]["reason"], "oversized_state_file")
+                rewritten = json.loads(state_file.read_text(encoding="utf-8"))
+                self.assertTrue(rewritten["state_compacted"])
+                self.assertNotIn("status_snapshot", rewritten)
+
+    def test_console_startup_does_not_reinject_selected_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            ):
+                module = self.load_module()
+                module.credential_vault().register_current("alpha")
+            self.write_fake_auth(login_home, email="beta@example.com", account_id="acc-beta")
+
+            result = self.run_cli(
+                root,
+                "console",
+                input_text="/quit\n",
+                extra_env={
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            auth_payload = json.loads((login_home / "auth.json").read_text(encoding="utf-8"))
+            self.assertEqual(auth_payload["tokens"]["account_id"], "acc-beta")
+
+    def test_register_current_assigns_next_numeric_alias_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            ):
+                module = self.load_module()
+                vault = module.credential_vault()
+                first_key = vault.register_current()
+                self.write_fake_auth(login_home, email="beta@example.com", account_id="acc-beta")
+                second_key = vault.register_current()
+                summary = vault.summary()
+                aliases = {profile["account_key"]: profile["alias"] for profile in summary["profiles"]}
+                self.assertEqual(first_key, "account_1")
+                self.assertEqual(second_key, "account_2")
+                self.assertEqual(aliases["account_1"], "1")
+                self.assertEqual(aliases["account_2"], "2")
+
+    def test_renumber_aliases_assigns_sequential_numeric_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            ):
+                module = self.load_module()
+                vault = module.credential_vault()
+                vault.register_current("main")
+                self.write_fake_auth(login_home, email="beta@example.com", account_id="acc-beta")
+                vault.register_current("main")
+                mapping = vault.renumber_aliases()
+                self.assertEqual(mapping, {"account_1": "1", "account_2": "2"})
+                summary = vault.summary()
+                aliases = {profile["account_key"]: profile["alias"] for profile in summary["profiles"]}
+                self.assertEqual(aliases["account_1"], "1")
+                self.assertEqual(aliases["account_2"], "2")
+
+    def test_resilience_guard_pauses_when_last_profile_is_below_reserve(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            ):
+                module = self.load_module()
+                vault = module.credential_vault()
+                account_key = vault.register_current("alpha")
+                payload = vault.load()
+                payload["accounts"][account_key]["usage_state"] = "available"
+                payload["accounts"][account_key]["usage_percent_remaining"] = 9.0
+                vault.save(payload)
+                self.run_cli(root, "submit", "--prompt", "Pause when reserve account is too low")
+                conn = module.connect()
+                snapshot = module.status_snapshot(conn)
+                conn.close()
+                execution_label, execution_reason = module.execution_state(snapshot)
+                self.assertEqual(execution_label, "PAUSED")
+                self.assertIn("reserve account protected", execution_reason)
+
+    def test_resilience_guard_allows_progress_when_backup_profile_is_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            ):
+                module = self.load_module()
+                vault = module.credential_vault()
+                first_key = vault.register_current("alpha")
+                self.write_fake_auth(login_home, email="beta@example.com", account_id="acc-beta")
+                second_key = vault.register_current("beta")
+                payload = vault.load()
+                payload["current_account_key"] = first_key
+                payload["accounts"][first_key]["status"] = "active"
+                payload["accounts"][first_key]["usage_state"] = "available"
+                payload["accounts"][first_key]["usage_percent_remaining"] = 9.0
+                payload["accounts"][second_key]["status"] = "ready"
+                payload["accounts"][second_key]["usage_state"] = "available"
+                payload["accounts"][second_key]["usage_percent_remaining"] = 42.0
+                vault.save(payload)
+                guard = module.resilience_execution_guard(refresh_usage=False)
+                self.assertFalse(guard["active"])
+                self.assertEqual(guard["available_alternatives"], [second_key])
+
+    def test_rotate_account_skips_low_reserve_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            ):
+                module = self.load_module()
+                vault = module.credential_vault()
+                current_key = vault.register_current("alpha")
+                self.write_fake_auth(login_home, email="beta@example.com", account_id="acc-beta")
+                low_key = vault.register_current("beta")
+                self.write_fake_auth(login_home, email="gamma@example.com", account_id="acc-gamma")
+                high_key = vault.register_current("gamma")
+                payload = vault.load()
+                payload["current_account_key"] = current_key
+                payload["accounts"][current_key]["status"] = "active"
+                payload["accounts"][current_key]["usage_state"] = "available"
+                payload["accounts"][current_key]["usage_percent_remaining"] = 4.0
+                payload["accounts"][low_key]["status"] = "ready"
+                payload["accounts"][low_key]["usage_state"] = "available"
+                payload["accounts"][low_key]["usage_percent_remaining"] = 5.0
+                payload["accounts"][high_key]["status"] = "ready"
+                payload["accounts"][high_key]["usage_state"] = "available"
+                payload["accounts"][high_key]["usage_percent_remaining"] = 55.0
+                vault.save(payload)
+                next_key = vault.rotate_account(reason="quota exceeded")
+                self.assertEqual(next_key, high_key)
+
+    def test_probe_resilience_usage_tolerates_probe_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            ):
+                module = self.load_module()
+                module.credential_vault().register_current("alpha")
+                with mock.patch.object(module, "probe_auth_rate_limits", side_effect=OSError("cleanup race")):
+                    summary = module.probe_resilience_usage(all_profiles=True)
+                self.assertEqual(summary["current_account_key"], "account_1")
+
+    def test_probe_resilience_usage_uses_parallel_workers_for_all_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            ):
+                module = self.load_module()
+                vault = module.credential_vault()
+                vault.register_current("1")
+                self.write_fake_auth(login_home, email="beta@example.com", account_id="acc-beta")
+                vault.register_current("2")
+
+                captured_workers: list[int] = []
+
+                class FakeFuture:
+                    def __init__(self, result):
+                        self._result = result
+
+                    def result(self):
+                        return self._result
+
+                class FakeExecutor:
+                    def __init__(self, max_workers: int):
+                        captured_workers.append(max_workers)
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, exc_type, exc, tb):
+                        return False
+
+                    def submit(self, fn, *args, **kwargs):
+                        return FakeFuture(fn(*args, **kwargs))
+
+                def fake_probe(_auth_data, *, codex_bin, scratch_root, timeout_seconds):
+                    return {
+                        "remaining_percent": 50.0,
+                        "used_percent": 50.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1776078754,
+                        "plan_type": "free",
+                        "limit_id": "codex",
+                    }
+
+                with mock.patch.object(module, "probe_auth_rate_limits", side_effect=fake_probe), \
+                    mock.patch.object(module.concurrent.futures, "ThreadPoolExecutor", FakeExecutor), \
+                    mock.patch.object(module.concurrent.futures, "as_completed", side_effect=lambda futures: list(futures)):
+                    summary = module.probe_resilience_usage(all_profiles=True)
+                self.assertEqual(summary["counts"]["active"], 1)
+                self.assertEqual(captured_workers, [2])
+
+    def test_usage_probe_worker_count_uses_all_accounts_by_default(self) -> None:
+        module = self.load_module()
+        self.assertEqual(module.usage_probe_worker_count(0), 1)
+        self.assertEqual(module.usage_probe_worker_count(1), 1)
+        self.assertEqual(module.usage_probe_worker_count(2), 2)
+        self.assertEqual(module.usage_probe_worker_count(99), 99)
+
+    def test_usage_probe_worker_count_respects_explicit_override(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEXLAB_USAGE_PROBE_WORKERS": "3"}, clear=False):
+            sys.modules.pop("codexlab_runtime", None)
+            module = self.load_module()
+        self.assertEqual(module.usage_probe_worker_count(0), 1)
+        self.assertEqual(module.usage_probe_worker_count(2), 2)
+        self.assertEqual(module.usage_probe_worker_count(99), 3)
 
     def test_run_loop_mock_locks_masterpiece_after_single_failed_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1428,7 +1934,7 @@ print(f"ok:{account_id}", flush=True)
             self.assertIn("CodexLab Event Stream | task=T-0001", result.stdout)
             self.assertIn("Progress:", result.stdout)
             self.assertIn("Execution:", result.stdout)
-            self.assertRegex(result.stdout, r"\[(READY|WAITING|RUNNING|BLOCKED|DONE)\]")
+            self.assertRegex(result.stdout, r"\[[^]]*(READY|WAITING|RUNNING|BLOCKED|DONE)\]")
             self.assertIn("state:", result.stdout)
             self.assertIn("next:", result.stdout)
             self.assertIn("scorecards:", result.stdout)
@@ -1442,7 +1948,7 @@ print(f"ok:{account_id}", flush=True)
 
             result = self.run_cli(root, "watch", "T-0001", "--once")
             self.assertIn("CodexLab Event Stream | task=T-0001", result.stdout)
-            self.assertIn("[DONE]", result.stdout)
+            self.assertIn("DONE]", result.stdout)
             self.assertIn("Champion confirmed", result.stdout)
 
     def test_watch_once_dashboard_marks_masterpiece_confirmation(self) -> None:

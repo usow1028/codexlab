@@ -5,6 +5,7 @@ import json
 import os
 import selectors
 import shlex
+import shutil
 import subprocess
 import tempfile
 import time
@@ -18,6 +19,7 @@ import fcntl
 
 
 PROFILE_STATUSES = {"ready", "active", "exhausted", "disabled"}
+RESERVE_PERCENT_THRESHOLD = float(os.environ.get("CODEXLAB_RESILIENCE_RESERVE_PERCENT_THRESHOLD", "10"))
 QUOTA_MARKERS = (
     "quota exceeded",
     "rate limit",
@@ -122,6 +124,7 @@ def normalize_pool(payload: dict[str, Any]) -> dict[str, Any]:
     payload.setdefault("current_account_key", None)
     payload.setdefault("auto_switch", True)
     payload.setdefault("last_rotation", {})
+    payload.setdefault("reserve_percent_threshold", RESERVE_PERCENT_THRESHOLD)
     accounts = payload.get("accounts")
     if not isinstance(accounts, dict):
         accounts = {}
@@ -228,10 +231,70 @@ class CredentialVault:
             "auto_switch": bool(payload.get("auto_switch", True)),
             "current_account_key": current,
             "current_alias": current_entry.get("alias"),
+            "reserve_percent_threshold": float(payload.get("reserve_percent_threshold", RESERVE_PERCENT_THRESHOLD)),
             "counts": counts,
             "profiles": profiles,
             "last_rotation": payload.get("last_rotation") or {},
         }
+
+    def reserve_percent_threshold(self) -> float:
+        payload = self.load()
+        return float(payload.get("reserve_percent_threshold", RESERVE_PERCENT_THRESHOLD))
+
+    def _profile_can_run(self, entry: dict[str, Any], *, threshold: float) -> bool:
+        if str(entry.get("status") or "") == "disabled":
+            return False
+        usage_state = str(entry.get("usage_state") or "unknown")
+        if usage_state == "quota_blocked":
+            return False
+        remaining = entry.get("usage_percent_remaining")
+        if remaining is None:
+            return True
+        try:
+            return float(remaining) > float(threshold)
+        except (TypeError, ValueError):
+            return True
+
+    def reserve_guard(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = normalize_pool(dict(payload or self.load()))
+        accounts = payload["accounts"]
+        current_key = payload.get("current_account_key")
+        threshold = float(payload.get("reserve_percent_threshold", RESERVE_PERCENT_THRESHOLD))
+        current_entry = accounts.get(current_key or "")
+        candidate_keys = [
+            key
+            for key, entry in sorted(accounts.items())
+            if key != current_key and self._profile_can_run(entry, threshold=threshold)
+        ]
+        guard = {
+            "active": False,
+            "reason": "",
+            "current_account_key": current_key,
+            "current_email": (current_entry or {}).get("fingerprint", {}).get("email"),
+            "current_remaining": (current_entry or {}).get("usage_percent_remaining"),
+            "reserve_percent_threshold": threshold,
+            "available_alternatives": candidate_keys,
+            "checked_at": utc_now(),
+        }
+        if not current_entry:
+            return guard
+        current_remaining = current_entry.get("usage_percent_remaining")
+        current_state = str(current_entry.get("usage_state") or "unknown")
+        current_can_run = self._profile_can_run(current_entry, threshold=threshold)
+        if candidate_keys:
+            return guard
+        if isinstance(current_remaining, (int, float)) and float(current_remaining) <= threshold:
+            guard["active"] = True
+            guard["reason"] = (
+                f"reserve account protected at {float(current_remaining):.0f}% left; "
+                "waiting for a recharged or newly registered profile"
+            )
+            return guard
+        if current_state == "quota_blocked" or not current_can_run:
+            guard["active"] = True
+            guard["reason"] = "all stored profiles are exhausted or below the reserve threshold"
+            return guard
+        return guard
 
     def auto_switch_enabled(self) -> bool:
         return bool(self.load().get("auto_switch", True))
@@ -279,6 +342,16 @@ class CredentialVault:
                 return key
         return None
 
+    def _next_numeric_alias(self, accounts: dict[str, Any]) -> str:
+        values: list[int] = []
+        for entry in accounts.values():
+            alias = str(entry.get("alias") or "").strip()
+            if alias.isdigit():
+                values.append(int(alias))
+        if values:
+            return str(max(values) + 1)
+        return str(len(accounts) + 1 if accounts else 1)
+
     def _mark_active(self, payload: dict[str, Any], account_key: str, *, previous_active_status: str = "ready") -> dict[str, Any]:
         accounts = payload["accounts"]
         previous_key = payload.get("current_account_key")
@@ -290,7 +363,7 @@ class CredentialVault:
         payload["current_account_key"] = account_key
         return payload
 
-    def register_current(self, alias: str) -> str:
+    def register_current(self, alias: str | None = None) -> str:
         auth_data = read_json(self.auth_path)
         if not auth_data:
             raise VaultError(f"missing auth file: {self.auth_path}")
@@ -299,7 +372,13 @@ class CredentialVault:
         fingerprint = extract_fingerprint(auth_data)
         account_key = self._matching_account_key(accounts, fingerprint) or self._next_account_key(accounts)
         entry = accounts.get(account_key, {})
-        entry["alias"] = alias.strip() or account_key
+        requested_alias = (alias or "").strip()
+        if requested_alias:
+            entry["alias"] = requested_alias
+        elif str(entry.get("alias") or "").strip():
+            entry["alias"] = str(entry.get("alias")).strip()
+        else:
+            entry["alias"] = self._next_numeric_alias(accounts)
         entry["status"] = "active"
         entry["fingerprint"] = fingerprint
         entry["auth_data"] = auth_data
@@ -311,6 +390,18 @@ class CredentialVault:
         payload = self._mark_active(payload, account_key)
         self.save(payload)
         return account_key
+
+    def renumber_aliases(self) -> dict[str, str]:
+        payload = self.load()
+        accounts = payload["accounts"]
+        mapping: dict[str, str] = {}
+        for index, account_key in enumerate(sorted(accounts), start=1):
+            alias = str(index)
+            accounts[account_key]["alias"] = alias
+            mapping[account_key] = alias
+        payload["accounts"] = accounts
+        self.save(payload)
+        return mapping
 
     def inject_auth(self, account_key: str, *, previous_active_status: str = "ready") -> None:
         payload = self.load()
@@ -368,7 +459,9 @@ class CredentialVault:
         if account_key not in accounts:
             raise VaultError(f"unknown account: {account_key}")
         entry = accounts[account_key]
+        current_key = payload.get("current_account_key")
         checked_at = utc_now()
+        threshold = float(payload.get("reserve_percent_threshold", RESERVE_PERCENT_THRESHOLD))
         used_percent = usage_summary.get("used_percent")
         remaining_percent = usage_summary.get("remaining_percent")
         entry["usage_percent_used"] = used_percent
@@ -385,8 +478,14 @@ class CredentialVault:
             entry["usage_state"] = "quota_blocked"
             entry["last_quota_blocked_at"] = checked_at
             entry["last_quota_reason"] = "rate limits exhausted"
+            if entry.get("status") in {"ready", "active"}:
+                entry["status"] = "active" if account_key == current_key else "exhausted"
         else:
             entry["usage_state"] = "available"
+            if float(remaining_percent) <= threshold and entry.get("status") == "ready":
+                entry["status"] = "active" if account_key == current_key else "exhausted"
+            elif entry.get("status") == "exhausted":
+                entry["status"] = "active" if account_key == current_key else "ready"
         accounts[account_key] = entry
         payload["accounts"] = accounts
         self.save(payload)
@@ -427,6 +526,7 @@ class CredentialVault:
         payload = self.load()
         accounts = payload["accounts"]
         previous_key = payload.get("current_account_key")
+        threshold = float(payload.get("reserve_percent_threshold", RESERVE_PERCENT_THRESHOLD))
         rotated_at = utc_now()
         if previous_key and previous_key in accounts:
             accounts[previous_key]["status"] = "exhausted"
@@ -434,12 +534,23 @@ class CredentialVault:
             accounts[previous_key]["last_quota_blocked_at"] = rotated_at
             accounts[previous_key]["last_quota_reason"] = reason
         next_key = None
-        for key in sorted(accounts):
-            if accounts[key]["status"] == "ready":
+        ready_accounts = [
+            key
+            for key in sorted(accounts)
+            if accounts[key]["status"] == "ready"
+        ]
+        for key in ready_accounts:
+            if self._profile_can_run(accounts[key], threshold=threshold):
                 next_key = key
                 break
+        if next_key is None:
+            for key in sorted(accounts):
+                if accounts[key]["status"] == "exhausted" and self._profile_can_run(accounts[key], threshold=threshold):
+                    accounts[key]["status"] = "ready"
+                    next_key = key
+                    break
         if not next_key:
-            raise VaultError("no ready account available for rotation")
+            raise VaultError("no eligible account available for rotation")
         payload["accounts"] = accounts
         payload["last_rotation"] = {
             "previous_account_key": previous_key,
@@ -459,6 +570,14 @@ class ResilientRunner:
         self.vault = vault
         self.max_attempts = max(1, int(max_attempts))
 
+    def attempt_budget(self, *, auto_switch: bool) -> int:
+        if not auto_switch or not self.vault.auto_switch_enabled():
+            return 1
+        summary = self.vault.summary()
+        counts = summary.get("counts") or {}
+        rotating_profiles = int(counts.get("active", 0)) + int(counts.get("ready", 0))
+        return max(self.max_attempts, max(rotating_profiles, 1))
+
     def execute(
         self,
         cmd_list: list[str],
@@ -474,8 +593,9 @@ class ResilientRunner:
         rotations: list[RotationRecord] = []
         quota_detected = False
         attempts = 0
+        attempt_budget = self.attempt_budget(auto_switch=auto_switch)
 
-        while attempts < self.max_attempts:
+        while attempts < attempt_budget:
             attempts += 1
             stdout_chunks: list[str] = []
             stderr_chunks: list[str] = []
@@ -562,11 +682,14 @@ class ResilientRunner:
                         pass
 
                 completed = subprocess.CompletedProcess(cmd_list, return_code, stdout_text, stderr_text)
-                if not (auto_switch and self.vault.auto_switch_enabled() and quota_hit_this_attempt and attempts < self.max_attempts):
+                if not (auto_switch and self.vault.auto_switch_enabled() and quota_hit_this_attempt and attempts < attempt_budget):
                     return ExecutionResult(completed=completed, attempts=attempts, rotations=rotations, quota_detected=quota_detected)
 
                 previous_key = current_key
-                next_key = self.vault.rotate_account(reason="quota exceeded")
+                try:
+                    next_key = self.vault.rotate_account(reason="quota exceeded")
+                except VaultError:
+                    return ExecutionResult(completed=completed, attempts=attempts, rotations=rotations, quota_detected=quota_detected)
                 rotations.append(
                     RotationRecord(
                         previous_account_key=previous_key,
@@ -766,11 +889,14 @@ def probe_auth_rate_limits(
 ) -> dict[str, Any]:
     scratch_root.mkdir(parents=True, exist_ok=True)
     os.chmod(scratch_root, 0o700)
-    with tempfile.TemporaryDirectory(prefix="rate-limit-", dir=str(scratch_root)) as tmpdir:
-        codex_home = Path(tmpdir)
+    tmpdir = tempfile.mkdtemp(prefix="rate-limit-", dir=str(scratch_root))
+    codex_home = Path(tmpdir)
+    try:
         atomic_write_json(codex_home / "auth.json", auth_data)
         payload = probe_codex_rate_limits(codex_bin, codex_home=codex_home, timeout_seconds=timeout_seconds)
         return extract_rate_limit_summary(payload)
+    finally:
+        shutil.rmtree(codex_home, ignore_errors=True)
 
 
 def parse_shell_command(command_text: str) -> list[str]:
