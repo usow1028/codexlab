@@ -28,12 +28,22 @@ if REPO_VENDOR_DIR.exists():
 
 try:
     from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.styles import Style
 except ImportError:
     PromptSession = None
+    Completer = None
+    Completion = None
     Style = None
 
-from codexlab_resilience import CredentialVault, ResilientRunner, VaultError, is_quota_text, parse_shell_command
+from codexlab_resilience import (
+    CredentialVault,
+    ResilientRunner,
+    VaultError,
+    is_quota_text,
+    parse_shell_command,
+    probe_auth_rate_limits,
+)
 
 
 ROOT = Path(os.environ.get("CODEXLAB_ROOT", SCRIPT_PATH.parent))
@@ -54,6 +64,7 @@ REAL_CODEX = os.environ.get("CODEXLAB_CODEX_BIN", "/usr/bin/codex")
 LOGIN_CODEX_HOME = Path(os.environ.get("CODEXLAB_LOGIN_CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
 RESILIENCE_POOL_PATH = Path(os.environ.get("CODEXLAB_POOL_PATH", str(Path.home() / ".codexlab" / "pool.json"))).expanduser()
 RESILIENCE_AUTH_PATH = LOGIN_CODEX_HOME / "auth.json"
+RESILIENCE_SCRATCH_DIR = RESILIENCE_POOL_PATH.parent / "probe-homes"
 DEFAULT_EXECUTOR = os.environ.get("CODEXLAB_EXECUTOR", "mock")
 LIVE_DEFAULT_EXECUTOR = os.environ.get("CODEXLAB_LIVE_EXECUTOR", "codex")
 DEFAULT_EXEC_TIMEOUT = float(os.environ.get("CODEXLAB_EXEC_TIMEOUT", "120"))
@@ -127,6 +138,27 @@ RUBRIC_WEIGHTS = {
 RUBRIC_CRITERIA = tuple(RUBRIC_WEIGHTS.keys())
 PROMPT_SESSIONS: dict[str, Any] = {}
 SIMULTANEOUS_WORKER_PAIR_MODES = {"initial_duel", "full_rematch"}
+CONSOLE_SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("/focus T-0001", "focus one task"),
+    ("/all", "show every task"),
+    ("/refresh", "reload the operator snapshot"),
+    ("/clear-tasks", "wipe runtime task history"),
+    ("/profile register <alias>", "login and save a new profile"),
+    ("/profile list", "list registered profiles"),
+    ("/profile current", "show the active profile"),
+    ("/profile activate <account_key|alias>", "switch to a stored profile"),
+    ("/profile disable <account_key|alias>", "exclude a profile from rotation"),
+    ("/profile enable <account_key|alias>", "return a profile to rotation"),
+    ("/profile reset-exhausted", "mark exhausted profiles ready again"),
+    ("/auto-switch on", "enable quota-triggered profile rotation"),
+    ("/auto-switch off", "disable quota-triggered profile rotation"),
+    ("/sync", "sync the current auth file back into the vault"),
+    ("/useage", "show the current profile's weekly limit"),
+    ("/useage all", "show the weekly limit for every profile"),
+    ("/run <command...>", "run an ad-hoc command through the resilience layer"),
+    ("/quit", "leave the shell-style console"),
+    ("/exit", "leave the shell-style console"),
+)
 
 
 def credential_vault() -> CredentialVault:
@@ -179,6 +211,31 @@ def prompt_session(name: str) -> Any | None:
     return session
 
 
+class SlashCommandCompleter(Completer if Completer is not None else object):
+    def __init__(self, commands: tuple[tuple[str, str], ...]) -> None:
+        self.commands = commands
+
+    def get_completions(self, document: Any, complete_event: Any) -> Any:
+        if Completion is None:
+            return
+        text = str(getattr(document, "text_before_cursor", "") or "")
+        query = text.lstrip()
+        if not query.startswith("/"):
+            return
+        lowered = query.lower()
+        for command_text, description in self.commands:
+            if command_text.lower().startswith(lowered):
+                yield Completion(
+                    command_text,
+                    start_position=-len(query),
+                    display=command_text,
+                    display_meta=description,
+                )
+
+
+CONSOLE_SLASH_COMPLETER = SlashCommandCompleter(CONSOLE_SLASH_COMMANDS) if Completer is not None else None
+
+
 def read_prompt_line(
     prompt_text: str,
     *,
@@ -188,6 +245,8 @@ def read_prompt_line(
     bottom_toolbar: Any = None,
     rprompt: Any = None,
     style: Any = None,
+    completer: Any = None,
+    complete_while_typing: bool = False,
 ) -> str:
     session = prompt_session(session_name)
     if session is not None:
@@ -199,6 +258,9 @@ def read_prompt_line(
                 bottom_toolbar=bottom_toolbar,
                 rprompt=rprompt,
                 style=style,
+                completer=completer,
+                complete_while_typing=complete_while_typing,
+                reserve_space_for_menu=8 if completer is not None else 0,
             )
         )
     return input(prompt_text)
@@ -6369,17 +6431,22 @@ def format_console_snapshot(
         f"reason={daemon_state.get('reason', '-')}"
     )
     quota_monitor = daemon_state.get("quota_monitor") or {}
-    if quota_monitor:
+    quota_status = str(quota_monitor.get("status") or "")
+    if quota_monitor and (
+        quota_status not in {"", "disabled"}
+        or quota_monitor.get("blocked_lanes")
+        or quota_monitor.get("last_probe")
+    ):
         blocked = ", ".join(lane_display_name(item["lane_id"]) for item in quota_monitor.get("blocked_lanes", [])) or "-"
         identity = quota_monitor.get("login_identity") or {}
         lines.append(
-            f"Quota: status={quota_monitor.get('status', '-')} "
+            f"Quota monitor: status={quota_monitor.get('status', '-')} "
             f"email={identity.get('email') or '-'} blocked={blocked}"
         )
     resilience = resilience_summary()
     lines.append(
         f"Resilience: auto_switch={'on' if resilience.get('auto_switch') else 'off'} "
-        f"current={resilience_current_label(resilience)}"
+        f"selected={resilience_current_label(resilience)}"
     )
     lines.append(f"Profiles: {resilience_counts_display(resilience.get('counts') or {})}")
     for profile in list(resilience.get("profiles") or [])[:4]:
@@ -6527,7 +6594,7 @@ def format_console_screen(
 ) -> list[str]:
     body = format_console_snapshot(snapshot, focus_task_id=focus_task_id)
     body_lines = wrap_console_lines(body, width)
-    help_line = "Enter submits a task | /focus T-0001 | /profile ... | /auto-switch on|off | /sync | /run ... | /quit"
+    help_line = "Enter submits a task | /focus T-0001 | /profile ... | /auto-switch on|off | /sync | /useage [all] | /run ... | /quit"
     status_line = f"Status: {status_message}" if status_message else "Status: ready"
     prompt_prefix = "Prompt> "
     prompt_line = f"{prompt_prefix}{trim_console_input(input_buffer, width - len(prompt_prefix))}"
@@ -6588,7 +6655,7 @@ def console_live_panel_text(
     live_lines = [
         live_body,
         "",
-        "Commands: /focus T-0001 | /all | /refresh | /clear-tasks | /profile ... | /auto-switch on|off | /sync | /run ... | /quit",
+        "Commands: /focus T-0001 | /all | /refresh | /clear-tasks | /profile ... | /auto-switch on|off | /sync | /useage [all] | /run ... | /quit",
         f"Status: {status_message or 'ready'}",
     ]
     prompt_header = ascii_panel_border("prompt", prompt_width)
@@ -6625,6 +6692,77 @@ def print_resilience_profiles(summary: dict[str, Any]) -> None:
         print("- none")
 
 
+def usage_state_label(profile: dict[str, Any]) -> str:
+    state = str(profile.get("usage_state") or "unknown")
+    return {
+        "available": "available",
+        "quota_blocked": "quota_blocked",
+        "unknown": "unknown",
+    }.get(state, state)
+
+
+def format_usage_remaining(profile: dict[str, Any]) -> str:
+    remaining = profile.get("usage_percent_remaining")
+    if isinstance(remaining, (int, float)):
+        if float(remaining).is_integer():
+            return f"{int(remaining)}% left"
+        return f"{remaining:.1f}% left"
+    return "unknown"
+
+
+def format_usage_reset(profile: dict[str, Any]) -> str:
+    resets_at = profile.get("usage_resets_at")
+    if not isinstance(resets_at, (int, float)):
+        return "-"
+    return datetime.fromtimestamp(float(resets_at), timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+
+def probe_resilience_usage(*, all_profiles: bool) -> dict[str, Any]:
+    vault = credential_vault()
+    payload = vault.load()
+    accounts = payload.get("accounts") or {}
+    account_keys: list[str]
+    if all_profiles:
+        account_keys = sorted(accounts)
+    else:
+        current_key = payload.get("current_account_key")
+        account_keys = [current_key] if current_key else []
+    for account_key in account_keys:
+        if not account_key or account_key not in accounts:
+            continue
+        auth_data = accounts[account_key].get("auth_data")
+        if not isinstance(auth_data, dict) or not auth_data:
+            continue
+        try:
+            usage_summary = probe_auth_rate_limits(
+                auth_data,
+                codex_bin=REAL_CODEX,
+                scratch_root=RESILIENCE_SCRATCH_DIR,
+                timeout_seconds=8.0,
+            )
+            vault.record_usage_probe(account_key, usage_summary)
+        except VaultError:
+            continue
+    return vault.summary()
+
+
+def print_resilience_usage(summary: dict[str, Any], *, all_profiles: bool) -> None:
+    profiles = list(summary.get("profiles") or [])
+    if not all_profiles:
+        profiles = [profile for profile in profiles if profile.get("is_current")]
+    print("")
+    print("Usage status:")
+    if not profiles:
+        print("- no matching profile")
+        return
+    for profile in profiles:
+        print(
+            f"- {profile.get('account_key')}: "
+            f"email={profile.get('email') or '-'} "
+            f"({format_usage_remaining(profile)})"
+        )
+
+
 def handle_resilience_console_command(
     command: str,
     *,
@@ -6632,7 +6770,7 @@ def handle_resilience_console_command(
     allow_profile_login: bool = True,
 ) -> str | None:
     text = command.strip()
-    if not text.startswith(("/profile", "/auto-switch", "/sync", "/run")):
+    if not text.startswith(("/profile", "/auto-switch", "/sync", "/run", "/useage", "/usage")):
         return None
     try:
         parts = parse_shell_command(text)
@@ -6696,6 +6834,14 @@ def handle_resilience_console_command(
             synced = vault.sync_auth()
             fingerprint = synced.get("fingerprint") or {}
             return f"sync complete account_id={fingerprint.get('account_id') or '-'}"
+        if cmd_name in {"/useage", "/usage"}:
+            if len(parts) == 1:
+                print_resilience_usage(probe_resilience_usage(all_profiles=False), all_profiles=False)
+                return "usage shown for current profile"
+            if len(parts) == 2 and parts[1] == "all":
+                print_resilience_usage(probe_resilience_usage(all_profiles=True), all_profiles=True)
+                return "usage shown for all profiles"
+            return "usage: /useage [all]"
         if cmd_name == "/run":
             if not allow_run:
                 return "/run is only available in the shell-style console"
@@ -6740,7 +6886,7 @@ def handle_console_command(
     if text == "/help":
         return (
             "commands: /focus T-0001, /all, /refresh, /clear-tasks, /profile ..., "
-            "/auto-switch on|off, /sync, /run ..., /quit",
+            "/auto-switch on|off, /sync, /useage [all], /run ..., /quit",
             focus_task_id,
             False,
         )
@@ -6793,6 +6939,8 @@ def cmd_console(args: argparse.Namespace) -> int:
                 ),
                 bottom_toolbar=(console_prompt_bottom_border if live_panel_mode else None),
                 style=(CONSOLE_PROMPT_STYLE if live_panel_mode else None),
+                completer=(CONSOLE_SLASH_COMPLETER if live_panel_mode else None),
+                complete_while_typing=live_panel_mode,
             )
         except EOFError:
             return 0

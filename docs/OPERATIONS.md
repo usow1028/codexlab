@@ -51,9 +51,12 @@ codexlab runs show RUN-0001
 - resilience profile data is stored in `~/.codexlab/pool.json` by default. When a current profile exists, `codexlab` injects it back into `~/.codex/auth.json` before live work starts.
 - `/profile register <alias>` launches `codex login` in the same terminal, then stores the resulting `~/.codex/auth.json` as a named profile and marks it current.
 - `/profile list` shows the vault, `/profile activate <account_key|alias>` switches manually, `/auto-switch on|off` controls quota-triggered rotation, and `/sync` writes refreshed tokens back into the vault.
+- `/useage` probes the current profile's live Codex weekly limit and prints a compact `email + remaining percent` summary.
+- `/useage all` runs the same live probe for every stored profile in isolation and prints the same compact weekly-limit summary for each profile.
 - `/run <command...>` executes an ad-hoc command through the resilience layer, streaming stdout/stderr live while re-injecting the next ready profile if quota/rate-limit text is detected.
 - when `prompt_toolkit` is installed, that shell-style console uses it for the prompt line so Korean/CJK IME input behaves more like a regular shell prompt.
 - the shell-style console also leaves the active input line bare instead of prefixing it with `Prompt>`.
+- typing `/` in that shell-style console now opens a slash-command suggestion menu, and the list keeps narrowing as you type more of the command.
 - `codexlab codex` launches raw stock Codex inside the lab workspace when you need the underlying tool directly.
 - the operator UI uses boxing-flavored labels: `worker-a` = `Red Corner`, `worker-b` = `Blue Corner`, the primary evaluator = `score judge`, the elder evaluator = `chief judge`, the absolute evaluator = `final arbiter`, and the final lock = `CHAMPION CONFIRMED`.
 - `watch --until-finished` is the quieter default: it appends only meaningful changes such as boxer starts, submissions, judging decisions, title changes, errors, and final champion confirmation.

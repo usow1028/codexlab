@@ -24,6 +24,11 @@ QUOTA_MARKERS = (
     "429",
     "usage limit",
 )
+USAGE_CLIENT_INFO = {
+    "name": "codexlab-resilience",
+    "title": "CodexLab Resilience",
+    "version": "1.0",
+}
 
 
 class VaultError(RuntimeError):
@@ -133,6 +138,18 @@ def normalize_pool(payload: dict[str, Any]) -> dict[str, Any]:
         entry.setdefault("fingerprint", {"account_id": None, "email": None})
         entry.setdefault("auth_data", {})
         entry.setdefault("last_sync", None)
+        entry.setdefault("usage_state", "unknown")
+        entry.setdefault("last_quota_blocked_at", None)
+        entry.setdefault("last_quota_reason", None)
+        entry.setdefault("last_activated_at", None)
+        entry.setdefault("last_verified_at", None)
+        entry.setdefault("usage_percent_remaining", None)
+        entry.setdefault("usage_percent_used", None)
+        entry.setdefault("usage_window_minutes", None)
+        entry.setdefault("usage_resets_at", None)
+        entry.setdefault("usage_plan_type", None)
+        entry.setdefault("usage_limit_id", None)
+        entry.setdefault("usage_checked_at", None)
         normalized_accounts[str(key)] = entry
     payload["accounts"] = normalized_accounts
     current = payload.get("current_account_key")
@@ -190,6 +207,19 @@ class CredentialVault:
                     "alias": entry.get("alias") or key,
                     "status": entry["status"],
                     "is_current": key == payload.get("current_account_key"),
+                    "email": (entry.get("fingerprint") or {}).get("email"),
+                    "usage_state": entry.get("usage_state") or "unknown",
+                    "last_sync": entry.get("last_sync"),
+                    "last_verified_at": entry.get("last_verified_at"),
+                    "last_quota_blocked_at": entry.get("last_quota_blocked_at"),
+                    "last_quota_reason": entry.get("last_quota_reason"),
+                    "usage_percent_remaining": entry.get("usage_percent_remaining"),
+                    "usage_percent_used": entry.get("usage_percent_used"),
+                    "usage_window_minutes": entry.get("usage_window_minutes"),
+                    "usage_resets_at": entry.get("usage_resets_at"),
+                    "usage_plan_type": entry.get("usage_plan_type"),
+                    "usage_limit_id": entry.get("usage_limit_id"),
+                    "usage_checked_at": entry.get("usage_checked_at"),
                 }
             )
         current = payload.get("current_account_key")
@@ -256,6 +286,7 @@ class CredentialVault:
             if accounts[previous_key]["status"] == "active":
                 accounts[previous_key]["status"] = previous_active_status
         accounts[account_key]["status"] = "active"
+        accounts[account_key]["last_activated_at"] = utc_now()
         payload["current_account_key"] = account_key
         return payload
 
@@ -273,6 +304,8 @@ class CredentialVault:
         entry["fingerprint"] = fingerprint
         entry["auth_data"] = auth_data
         entry["last_sync"] = utc_now()
+        entry["last_verified_at"] = utc_now()
+        entry["usage_state"] = entry.get("usage_state") or "unknown"
         accounts[account_key] = entry
         payload["accounts"] = accounts
         payload = self._mark_active(payload, account_key)
@@ -310,12 +343,54 @@ class CredentialVault:
         accounts[target_key]["auth_data"] = auth_data
         accounts[target_key]["fingerprint"] = incoming
         accounts[target_key]["last_sync"] = utc_now()
+        accounts[target_key]["last_verified_at"] = utc_now()
+        accounts[target_key]["usage_state"] = "available"
         payload["accounts"] = accounts
         self.save(payload)
         return accounts[target_key]
 
     def activate(self, account_key: str) -> None:
         self.inject_auth(account_key, previous_active_status="ready")
+
+    def account_auth_data(self, account_key: str) -> dict[str, Any]:
+        payload = self.load()
+        accounts = payload["accounts"]
+        if account_key not in accounts:
+            raise VaultError(f"unknown account: {account_key}")
+        auth_data = accounts[account_key].get("auth_data")
+        if not isinstance(auth_data, dict) or not auth_data:
+            raise VaultError(f"account has no auth payload: {account_key}")
+        return dict(auth_data)
+
+    def record_usage_probe(self, account_key: str, usage_summary: dict[str, Any]) -> dict[str, Any]:
+        payload = self.load()
+        accounts = payload["accounts"]
+        if account_key not in accounts:
+            raise VaultError(f"unknown account: {account_key}")
+        entry = accounts[account_key]
+        checked_at = utc_now()
+        used_percent = usage_summary.get("used_percent")
+        remaining_percent = usage_summary.get("remaining_percent")
+        entry["usage_percent_used"] = used_percent
+        entry["usage_percent_remaining"] = remaining_percent
+        entry["usage_window_minutes"] = usage_summary.get("window_minutes")
+        entry["usage_resets_at"] = usage_summary.get("resets_at")
+        entry["usage_plan_type"] = usage_summary.get("plan_type")
+        entry["usage_limit_id"] = usage_summary.get("limit_id")
+        entry["usage_checked_at"] = checked_at
+        entry["last_verified_at"] = checked_at
+        if remaining_percent is None:
+            entry["usage_state"] = entry.get("usage_state") or "unknown"
+        elif remaining_percent <= 0:
+            entry["usage_state"] = "quota_blocked"
+            entry["last_quota_blocked_at"] = checked_at
+            entry["last_quota_reason"] = "rate limits exhausted"
+        else:
+            entry["usage_state"] = "available"
+        accounts[account_key] = entry
+        payload["accounts"] = accounts
+        self.save(payload)
+        return entry
 
     def disable(self, account_key: str) -> None:
         payload = self.load()
@@ -343,6 +418,7 @@ class CredentialVault:
         for key, entry in payload["accounts"].items():
             if entry["status"] == "exhausted":
                 entry["status"] = "ready" if key != payload.get("current_account_key") else "active"
+                entry["usage_state"] = "unknown"
                 changed += 1
         self.save(payload)
         return changed
@@ -351,8 +427,12 @@ class CredentialVault:
         payload = self.load()
         accounts = payload["accounts"]
         previous_key = payload.get("current_account_key")
+        rotated_at = utc_now()
         if previous_key and previous_key in accounts:
             accounts[previous_key]["status"] = "exhausted"
+            accounts[previous_key]["usage_state"] = "quota_blocked"
+            accounts[previous_key]["last_quota_blocked_at"] = rotated_at
+            accounts[previous_key]["last_quota_reason"] = reason
         next_key = None
         for key in sorted(accounts):
             if accounts[key]["status"] == "ready":
@@ -365,7 +445,7 @@ class CredentialVault:
             "previous_account_key": previous_key,
             "next_account_key": next_key,
             "reason": reason,
-            "rotated_at": utc_now(),
+            "rotated_at": rotated_at,
         }
         self.save(payload)
         self.inject_auth(next_key, previous_active_status="exhausted")
@@ -499,12 +579,21 @@ class ResilientRunner:
                     stderr_consumer(f"[resilience] switched account {previous_key or '-'} -> {next_key}\n")
             finally:
                 selector.close()
-                if process.stdin is not None and not process.stdin.closed:
-                    process.stdin.close()
-                if process.stdout is not None and not process.stdout.closed:
-                    process.stdout.close()
-                if process.stderr is not None and not process.stderr.closed:
-                    process.stderr.close()
+                try:
+                    if process.stdin is not None and not process.stdin.closed:
+                        process.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    if process.stdout is not None and not process.stdout.closed:
+                        process.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    if process.stderr is not None and not process.stderr.closed:
+                        process.stderr.close()
+                except Exception:
+                    pass
 
         return ExecutionResult(
             completed=subprocess.CompletedProcess(cmd_list, 1, "", ""),
@@ -512,6 +601,176 @@ class ResilientRunner:
             rotations=rotations,
             quota_detected=quota_detected,
         )
+
+
+def _jsonrpc_request(request_id: int, method: str, params: Any) -> str:
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        },
+        ensure_ascii=True,
+    )
+
+
+def extract_rate_limit_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    by_limit = payload.get("rateLimitsByLimitId")
+    snapshot = None
+    if isinstance(by_limit, dict):
+        if isinstance(by_limit.get("codex"), dict):
+            snapshot = by_limit.get("codex")
+        else:
+            for value in by_limit.values():
+                if isinstance(value, dict):
+                    snapshot = value
+                    break
+    if snapshot is None and isinstance(payload.get("rateLimits"), dict):
+        snapshot = payload.get("rateLimits")
+    if not isinstance(snapshot, dict):
+        raise VaultError("no rate limit snapshot returned")
+    primary = snapshot.get("primary")
+    if not isinstance(primary, dict):
+        primary = snapshot.get("secondary") if isinstance(snapshot.get("secondary"), dict) else {}
+    used_raw = primary.get("usedPercent")
+    used_percent = float(used_raw) if isinstance(used_raw, (int, float)) else None
+    remaining_percent = None if used_percent is None else max(0.0, min(100.0, 100.0 - used_percent))
+    resets_raw = primary.get("resetsAt")
+    resets_at = int(resets_raw) if isinstance(resets_raw, (int, float)) else None
+    window_raw = primary.get("windowDurationMins")
+    window_minutes = int(window_raw) if isinstance(window_raw, (int, float)) else None
+    return {
+        "limit_id": snapshot.get("limitId"),
+        "limit_name": snapshot.get("limitName"),
+        "used_percent": used_percent,
+        "remaining_percent": remaining_percent,
+        "window_minutes": window_minutes,
+        "resets_at": resets_at,
+        "plan_type": snapshot.get("planType"),
+        "credits": snapshot.get("credits") if isinstance(snapshot.get("credits"), dict) else None,
+    }
+
+
+def probe_codex_rate_limits(
+    codex_bin: str,
+    *,
+    codex_home: Path,
+    timeout_seconds: float = 8.0,
+) -> dict[str, Any]:
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(codex_home)
+    process = subprocess.Popen(
+        [codex_bin, "app-server"],
+        cwd=str(codex_home),
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    selector = selectors.DefaultSelector()
+    if process.stdout is not None:
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    if process.stderr is not None:
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    try:
+        requests = (
+            _jsonrpc_request(1, "initialize", {"clientInfo": USAGE_CLIENT_INFO, "capabilities": None}),
+            _jsonrpc_request(2, "account/rateLimits/read", None),
+        )
+        if process.stdin is None:
+            raise VaultError("app-server stdin unavailable")
+        for request in requests:
+            process.stdin.write(request + "\n")
+            process.stdin.flush()
+        deadline = time.monotonic() + timeout_seconds
+        response_payload: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            if process.poll() is not None and not selector.get_map():
+                break
+            events = selector.select(timeout=0.1)
+            if not events and process.poll() is not None:
+                for key in list(selector.get_map().values()):
+                    stream = key.fileobj
+                    tail = stream.read()
+                    if tail:
+                        if key.data == "stdout":
+                            stdout_lines.append(tail)
+                        else:
+                            stderr_lines.append(tail)
+                    selector.unregister(stream)
+                continue
+            for key, _mask in events:
+                stream = key.fileobj
+                line = stream.readline()
+                if line == "":
+                    selector.unregister(stream)
+                    continue
+                if key.data == "stdout":
+                    stdout_lines.append(line)
+                    try:
+                        message = json.loads(line)
+                    except json.JSONDecodeError:
+                        message = None
+                    if isinstance(message, dict) and message.get("id") == 2:
+                        if isinstance(message.get("result"), dict):
+                            response_payload = message["result"]
+                            break
+                        error = message.get("error")
+                        raise VaultError(f"rate limit query failed: {error}")
+                else:
+                    stderr_lines.append(line)
+            if response_payload is not None:
+                break
+        if response_payload is None:
+            combined = "".join(stdout_lines + stderr_lines).strip()
+            raise VaultError(f"no account/rateLimits response received: {combined or 'empty output'}")
+        return response_payload
+    finally:
+        selector.close()
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except Exception:
+            pass
+        try:
+            if process.stdout is not None:
+                process.stdout.close()
+        except Exception:
+            pass
+        try:
+            if process.stderr is not None:
+                process.stderr.close()
+        except Exception:
+            pass
+        try:
+            process.terminate()
+            process.wait(timeout=2.0)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+
+def probe_auth_rate_limits(
+    auth_data: dict[str, Any],
+    *,
+    codex_bin: str,
+    scratch_root: Path,
+    timeout_seconds: float = 8.0,
+) -> dict[str, Any]:
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    os.chmod(scratch_root, 0o700)
+    with tempfile.TemporaryDirectory(prefix="rate-limit-", dir=str(scratch_root)) as tmpdir:
+        codex_home = Path(tmpdir)
+        atomic_write_json(codex_home / "auth.json", auth_data)
+        payload = probe_codex_rate_limits(codex_bin, codex_home=codex_home, timeout_seconds=timeout_seconds)
+        return extract_rate_limit_summary(payload)
 
 
 def parse_shell_command(command_text: str) -> list[str]:

@@ -22,6 +22,9 @@ INSTALL_SCRIPT = Path("/home/usow/codexlab/scripts/install-codexlab.sh")
 
 class CodexLabCliTests(TestCase):
     def load_module(self):
+        root_env = os.environ.get("CODEXLAB_ROOT")
+        if root_env:
+            os.environ["CODEXLAB_POOL_PATH"] = str(Path(root_env) / ".codexlab" / "pool.json")
         spec = importlib.util.spec_from_file_location("codexlab_runtime", SCRIPT)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
@@ -39,6 +42,7 @@ class CodexLabCliTests(TestCase):
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["CODEXLAB_ROOT"] = str(root)
+        env.setdefault("CODEXLAB_POOL_PATH", str(root / ".codexlab" / "pool.json"))
         if extra_env:
             env.update(extra_env)
         return subprocess.run(
@@ -514,6 +518,8 @@ raise SystemExit(int(entry.get("exit_code", 0)))
                 session_name="console",
                 refresh_interval=0.5,
                 message=message,
+                completer=module.CONSOLE_SLASH_COMPLETER,
+                complete_while_typing=True,
             )
             self.assertEqual(value, "한글 입력")
             self.assertIn("console", module.PROMPT_SESSIONS)
@@ -521,7 +527,24 @@ raise SystemExit(int(entry.get("exit_code", 0)))
             prompt_message, kwargs = module.PROMPT_SESSIONS["console"].calls[0]
             self.assertIs(prompt_message, message)
             self.assertEqual(kwargs["refresh_interval"], 0.5)
+            self.assertTrue(kwargs["complete_while_typing"])
+            self.assertIs(kwargs["completer"], module.CONSOLE_SLASH_COMPLETER)
+            self.assertEqual(kwargs["reserve_space_for_menu"], 8)
             self.assertNotIn("message", kwargs)
+
+    def test_console_slash_completer_suggests_matching_commands(self) -> None:
+        module = self.load_module()
+        completer = module.CONSOLE_SLASH_COMPLETER
+        self.assertIsNotNone(completer)
+        slash_matches = [item.text for item in completer.get_completions(mock.Mock(text_before_cursor="/"), None)]
+        self.assertIn("/profile register <alias>", slash_matches)
+        self.assertIn("/auto-switch on", slash_matches)
+        self.assertIn("/useage", slash_matches)
+        self.assertIn("/useage all", slash_matches)
+        self.assertIn("/quit", slash_matches)
+
+        profile_matches = [item.text for item in completer.get_completions(mock.Mock(text_before_cursor="/profile a"), None)]
+        self.assertEqual(profile_matches, ["/profile activate <account_key|alias>"])
 
     def test_console_live_toolbar_text_reflects_current_task_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -537,7 +560,7 @@ raise SystemExit(int(entry.get("exit_code", 0)))
             self.assertIn("Commands: /focus T-0001 | /all | /refresh | /clear-tasks", toolbar)
             self.assertIn("/profile ...", toolbar)
             self.assertIn("/auto-switch on|off", toolbar)
-            self.assertIn("/sync | /run ... | /quit", toolbar)
+            self.assertIn("/sync | /useage [all] | /run ... | /quit", toolbar)
             self.assertIn("Status: ready", toolbar)
             self.assertIn("| prompt |", toolbar)
             self.assertTrue(toolbar.rstrip().endswith("-"))
@@ -710,6 +733,107 @@ print(f"ok:{account_id}", flush=True)
                 self.assertIn("run exit=0", run_status)
                 self.assertIn("ok from resilience run", run_output.getvalue())
 
+    def test_useage_commands_show_live_weekly_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            ):
+                module = self.load_module()
+                vault = module.credential_vault()
+                vault.register_current("alpha")
+                self.write_fake_auth(login_home, email="beta@example.com", account_id="acc-beta")
+                vault.register_current("beta")
+                vault.activate("account_1")
+                vault.rotate_account(reason="quota exceeded")
+
+                def fake_probe(auth_data, *, codex_bin, scratch_root, timeout_seconds):
+                    account_id = auth_data["tokens"]["account_id"]
+                    if account_id == "acc-alpha":
+                        return {
+                            "limit_id": "codex",
+                            "limit_name": None,
+                            "used_percent": 100.0,
+                            "remaining_percent": 0.0,
+                            "window_minutes": 10080,
+                            "resets_at": 1776045971,
+                            "plan_type": "free",
+                            "credits": {"hasCredits": False, "unlimited": False, "balance": None},
+                        }
+                    if account_id == "acc-beta":
+                        return {
+                            "limit_id": "codex",
+                            "limit_name": None,
+                            "used_percent": 69.0,
+                            "remaining_percent": 31.0,
+                            "window_minutes": 10080,
+                            "resets_at": 1776045971,
+                            "plan_type": "free",
+                            "credits": {"hasCredits": False, "unlimited": False, "balance": None},
+                        }
+                    raise AssertionError(f"unexpected account id: {account_id}")
+
+                current_output = io.StringIO()
+                with mock.patch.object(module, "probe_auth_rate_limits", side_effect=fake_probe):
+                    with mock.patch("sys.stdout", current_output):
+                        current_status = module.handle_resilience_console_command("/useage")
+                self.assertEqual(current_status, "usage shown for current profile")
+                rendered_current = current_output.getvalue()
+                self.assertIn("Usage status:", rendered_current)
+                self.assertIn("- account_2: email=beta@example.com (31% left)", rendered_current)
+                self.assertNotIn("alias=", rendered_current)
+                self.assertNotIn("weekly_limit=", rendered_current)
+
+                all_output = io.StringIO()
+                with mock.patch.object(module, "probe_auth_rate_limits", side_effect=fake_probe):
+                    with mock.patch("sys.stdout", all_output):
+                        all_status = module.handle_resilience_console_command("/useage all")
+                self.assertEqual(all_status, "usage shown for all profiles")
+                rendered_all = all_output.getvalue()
+                self.assertIn("- account_1: email=alpha@example.com (0% left)", rendered_all)
+                self.assertIn("- account_2: email=beta@example.com (31% left)", rendered_all)
+                self.assertNotIn("alias=", rendered_all)
+                self.assertNotIn("last_checked_at=", rendered_all)
+
+    def test_extract_rate_limit_summary_computes_remaining_percent(self) -> None:
+        resilience_spec = importlib.util.spec_from_file_location(
+            "codexlab_resilience_runtime",
+            Path("/home/usow/codexlab/codexlab_resilience.py"),
+        )
+        assert resilience_spec is not None and resilience_spec.loader is not None
+        resilience_module = importlib.util.module_from_spec(resilience_spec)
+        sys.modules[resilience_spec.name] = resilience_module
+        resilience_spec.loader.exec_module(resilience_module)
+        summary = resilience_module.extract_rate_limit_summary(
+            {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "limitName": None,
+                    "primary": {
+                        "usedPercent": 69,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1776045971,
+                    },
+                    "secondary": None,
+                    "credits": {"hasCredits": False, "unlimited": False, "balance": None},
+                    "planType": "free",
+                },
+                "rateLimitsByLimitId": None,
+            }
+        )
+        self.assertEqual(summary["limit_id"], "codex")
+        self.assertEqual(summary["plan_type"], "free")
+        self.assertEqual(summary["window_minutes"], 10080)
+        self.assertEqual(summary["remaining_percent"], 31.0)
+
     def test_ensure_selected_resilience_profile_reinjects_current_auth(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -751,7 +875,7 @@ print(f"ok:{account_id}", flush=True)
                 module.credential_vault().register_current("alpha")
                 snapshot = json.loads(self.run_cli(root, "dashboard", "--json").stdout)
                 rendered = module.format_console_snapshot(snapshot, focus_task_id=None)
-                self.assertIn("Resilience: auto_switch=on current=account_1/alpha", rendered)
+                self.assertIn("Resilience: auto_switch=on selected=account_1/alpha", rendered)
                 self.assertIn("Profiles: ready=0 active=1 exhausted=0 disabled=0", rendered)
 
     def test_daemon_status_tolerates_empty_state_file(self) -> None:
