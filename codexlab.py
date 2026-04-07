@@ -9,6 +9,7 @@ import json
 import os
 import re
 import signal
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -41,10 +42,12 @@ from codexlab_resilience import (
     CredentialVault,
     ResilientRunner,
     VaultError,
+    atomic_write_json,
     is_quota_text,
     parse_shell_command,
     probe_auth_rate_limits,
 )
+from codexlab_asymptote import AsymptoteController
 
 
 ROOT = Path(os.environ.get("CODEXLAB_ROOT", SCRIPT_PATH.parent))
@@ -54,13 +57,22 @@ EVENTS_DIR = CONTROL_DIR / "events"
 EVENTS_FILE = EVENTS_DIR / "events.jsonl"
 RUNS_DIR = CONTROL_DIR / "runs"
 DAEMON_DIR = CONTROL_DIR / "daemon"
+ASYMPTOTE_DIR = ROOT / "asymptote"
 DAEMON_PID_FILE = DAEMON_DIR / "daemon.pid"
 DAEMON_STATE_FILE = DAEMON_DIR / "daemon-state.json"
+LEGACY_ASYMPTOTE_STATE_FILE = DAEMON_DIR / "asymptote-state.json"
+ASYMPTOTE_STATE_FILE = ASYMPTOTE_DIR / "state.json"
 DAEMON_LOG_FILE = DAEMON_DIR / "daemon.log"
 TASKS_DIR = ROOT / "tasks"
 AGENTS_DIR = ROOT / "agents"
 LAB_HOME = ROOT / ".codex-home"
 TEMPLATES_DIR = ROOT / "templates"
+LEGACY_USER_PREFS_FILE = ROOT / "user_prefs.md"
+LEGACY_AI_PREFS_FILE = ROOT / "ai_prefs.md"
+LEGACY_LETTERS_FILE = ROOT / "letters.md"
+USER_PREFS_FILE = ASYMPTOTE_DIR / "user_prefs.md"
+AI_PREFS_FILE = ASYMPTOTE_DIR / "ai_prefs.md"
+LETTERS_FILE = ASYMPTOTE_DIR / "letters.md"
 REAL_CODEX = os.environ.get("CODEXLAB_CODEX_BIN", "/usr/bin/codex")
 LOGIN_CODEX_HOME = Path(os.environ.get("CODEXLAB_LOGIN_CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
 RESILIENCE_POOL_PATH = Path(os.environ.get("CODEXLAB_POOL_PATH", str(Path.home() / ".codexlab" / "pool.json"))).expanduser()
@@ -76,15 +88,71 @@ DEFAULT_WATCH_INTERVAL = float(os.environ.get("CODEXLAB_WATCH_INTERVAL", "1.0"))
 DEFAULT_EVENTS_LIMIT = int(os.environ.get("CODEXLAB_EVENTS_LIMIT", "12"))
 DEFAULT_QUOTA_RECHECK_INTERVAL = float(os.environ.get("CODEXLAB_QUOTA_RECHECK_INTERVAL", "60"))
 DEFAULT_RESILIENCE_RECHECK_INTERVAL = float(os.environ.get("CODEXLAB_RESILIENCE_RECHECK_INTERVAL", "60"))
+DEFAULT_ASYMPTOTE_INTERVAL_SECONDS = float(os.environ.get("CODEXLAB_ASYMPTOTE_INTERVAL_SECONDS", "3600"))
 _USAGE_PROBE_WORKERS_OVERRIDE = os.environ.get("CODEXLAB_USAGE_PROBE_WORKERS")
 DEFAULT_USAGE_PROBE_WORKERS = (
     max(1, int(_USAGE_PROBE_WORKERS_OVERRIDE))
     if _USAGE_PROBE_WORKERS_OVERRIDE is not None
     else None
 )
+LIVE_CODEX_SANDBOX = os.environ.get("CODEXLAB_LIVE_SANDBOX", "danger-full-access").strip() or "danger-full-access"
 MAX_DAEMON_STATE_FILE_BYTES = int(os.environ.get("CODEXLAB_MAX_DAEMON_STATE_FILE_BYTES", str(1024 * 1024)))
 AUTO_QUOTA_RECOVERY = os.environ.get("CODEXLAB_AUTO_RECOVER_QUOTA", "1").strip().lower() not in {"0", "false", "no", "off"}
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+PATCH_MODE_STRONG_HINTS = (
+    "code change",
+    "file",
+    "files",
+    "folder",
+    "directory",
+    "module",
+    "plugin",
+    "workspace",
+    "repo",
+    "repository",
+    "test",
+    "tests",
+    "space/",
+    ".py",
+    "wire it into the repo",
+    "파일",
+    "폴더",
+    "디렉토리",
+    "모듈",
+    "플러그인",
+    "테스트",
+)
+PATCH_MODE_WEAK_HINTS = (
+    "implement",
+    "implementation",
+    "patch",
+    "fix",
+    "create",
+    "build",
+    "modify",
+    "update",
+    "add ",
+    "구현",
+    "수정",
+    "변경",
+    "추가",
+    "생성",
+    "만들",
+)
+PROPOSAL_MODE_HINTS = (
+    "plan",
+    "design",
+    "proposal",
+    "blueprint",
+    "architecture",
+    "outline",
+    "strategy",
+    "spec",
+    "설계",
+    "계획",
+    "제안",
+    "청사진",
+)
 STREAM_EVENT_TYPES = {
     "task_submitted",
     "run_started",
@@ -100,9 +168,17 @@ STREAM_EVENT_TYPES = {
     "quota_auto_resume",
     "resilience_paused",
     "resilience_resumed",
+    "task_applied",
+    "task_apply_failed",
+    "asymptote_started",
+    "asymptote_stopped",
+    "asymptote_pulse",
+    "asymptote_human_note",
+    "asymptote_error",
     "daemon_started",
     "daemon_stopped",
 }
+ASYMPTOTE_CONTROLLER: AsymptoteController | None = None
 
 
 def default_exec_timeout_for(executor: str) -> float:
@@ -186,6 +262,7 @@ SIMULTANEOUS_WORKER_PAIR_MODES = {"initial_duel", "full_rematch"}
 CONSOLE_SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/focus T-0001", "focus one task"),
     ("/all", "show every task"),
+    ("/status", "refresh the live status panel"),
     ("/refresh", "reload the operator snapshot"),
     ("/clear-tasks", "wipe runtime task history"),
     ("/profile register", "login and save the next numbered profile"),
@@ -199,6 +276,8 @@ CONSOLE_SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/auto-switch on", "enable quota-triggered profile rotation"),
     ("/auto-switch off", "disable quota-triggered profile rotation"),
     ("/sync", "sync the current auth file back into the vault"),
+    ("/asymptote on", "open the epsilon interface and start the hourly pulse"),
+    ("/asymptote off", "close the epsilon interface"),
     ("/useage", "show the current profile's weekly limit"),
     ("/useage all", "show the weekly limit for every profile"),
     ("/run <command...>", "run an ad-hoc command through the resilience layer"),
@@ -209,6 +288,114 @@ CONSOLE_SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
 
 def credential_vault() -> CredentialVault:
     return CredentialVault(RESILIENCE_POOL_PATH, RESILIENCE_AUTH_PATH)
+
+
+def asymptote_controller() -> AsymptoteController:
+    global ASYMPTOTE_CONTROLLER
+    if ASYMPTOTE_CONTROLLER is None:
+        ASYMPTOTE_CONTROLLER = AsymptoteController(
+            state_path=ASYMPTOTE_STATE_FILE,
+            user_prefs_path=USER_PREFS_FILE,
+            ai_prefs_path=AI_PREFS_FILE,
+            letters_path=LETTERS_FILE,
+            interval_seconds=DEFAULT_ASYMPTOTE_INTERVAL_SECONDS,
+            event_callback=append_event,
+            legacy_state_path=LEGACY_ASYMPTOTE_STATE_FILE,
+            legacy_user_prefs_path=LEGACY_USER_PREFS_FILE,
+            legacy_ai_prefs_path=LEGACY_AI_PREFS_FILE,
+            legacy_letters_path=LEGACY_LETTERS_FILE,
+        )
+    return ASYMPTOTE_CONTROLLER
+
+
+def asymptote_snapshot() -> dict[str, Any]:
+    try:
+        return asymptote_controller().snapshot()
+    except Exception as exc:
+        return {
+            "active": False,
+            "owner_pid": 0,
+            "status": "BLOCKED",
+            "reason": f"두 세계의 주파수가 어긋나 계면이 불안정해졌습니다 (Interface Instability): {exc}",
+            "progress_text": "[----------------] 0m left to horizon",
+            "interface_state": "unstable",
+            "last_error": str(exc),
+            "human_anchor": "-",
+            "ai_anchor": "-",
+            "letters_anchor": "-",
+        }
+
+
+def stop_owned_asymptote_engine() -> None:
+    try:
+        payload = asymptote_snapshot()
+        if payload.get("active") and int(payload.get("owner_pid") or 0) == os.getpid():
+            asymptote_controller().stop()
+    except Exception:
+        return
+
+
+def preferred_terminal_launcher() -> str | None:
+    desktop = str(os.environ.get("XDG_CURRENT_DESKTOP") or "")
+    if (os.environ.get("KONSOLE_VERSION") or "KDE" in desktop) and shutil.which("konsole"):
+        return "konsole"
+    for candidate in ("gnome-terminal", "kitty", "wezterm", "alacritty", "x-terminal-emulator", "xterm"):
+        if shutil.which(candidate):
+            return candidate
+    return None
+
+
+def external_asymptote_console_supported() -> bool:
+    return preferred_terminal_launcher() is not None
+
+
+def spawn_asymptote_console(*, activate: bool) -> str:
+    launcher = preferred_terminal_launcher()
+    if launcher is None:
+        raise VaultError("no supported terminal launcher found for asymptote-console")
+    inner_args = [sys.executable, str(SCRIPT_PATH), "asymptote-console"]
+    if activate:
+        inner_args.append("--activate")
+    else:
+        inner_args.append("--attach")
+    command_text = f"cd {shlex.quote(str(ROOT))} && exec {' '.join(shlex.quote(part) for part in inner_args)}"
+    if launcher == "konsole":
+        command = [
+            launcher,
+            "--new-tab",
+            "-p",
+            "tabtitle=CodexLab Asymptote",
+            "-e",
+            "/usr/bin/bash",
+            "-lc",
+            command_text,
+        ]
+        destination = "new Konsole tab"
+    elif launcher == "gnome-terminal":
+        command = [launcher, "--", "/usr/bin/bash", "-lc", command_text]
+        destination = "new terminal window"
+    elif launcher == "kitty":
+        command = [launcher, "--title", "CodexLab Asymptote", "/usr/bin/bash", "-lc", command_text]
+        destination = "new terminal window"
+    elif launcher == "wezterm":
+        command = [launcher, "start", "--cwd", str(ROOT), "/usr/bin/bash", "-lc", command_text]
+        destination = "new terminal window"
+    elif launcher == "alacritty":
+        command = [launcher, "--title", "CodexLab Asymptote", "-e", "/usr/bin/bash", "-lc", command_text]
+        destination = "new terminal window"
+    else:
+        command = [launcher, "-e", "/usr/bin/bash", "-lc", command_text]
+        destination = "new terminal window"
+    subprocess.Popen(
+        command,
+        cwd=str(ROOT),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    mode = "activated" if activate else "attached"
+    return f"opened asymptote console in a {destination} ({mode})"
 
 
 def resilience_summary() -> dict[str, Any]:
@@ -432,6 +619,7 @@ DEFAULT_WORKER_TEMPLATE = textwrap.dedent(
 
     Task ID: {task_id}
     Title: {task_title}
+    Task mode: {task_mode}
 
     Primary task brief:
     {task_prompt}
@@ -454,6 +642,9 @@ DEFAULT_WORKER_TEMPLATE = textwrap.dedent(
     Round context:
     {round_context}
 
+    Mode expectations:
+    {mode_expectations}
+
     Instructions:
     - Produce the strongest possible standalone answer for the task.
     - Your goal is to improve your own weighted-rubric score, not to write a debate transcript.
@@ -473,6 +664,7 @@ DEFAULT_EVALUATOR_TEMPLATE = textwrap.dedent(
 
     Task ID: {task_id}
     Title: {task_title}
+    Task mode: {task_mode}
 
     Original task brief:
     {task_prompt}
@@ -487,6 +679,7 @@ DEFAULT_EVALUATOR_TEMPLATE = textwrap.dedent(
     - verification = 10
     Derive the overall winner from the weighted totals, not from an unweighted sum or intuition alone.
     {tie_policy}
+    {mode_scoring_guidance}
     Always return both loser_brief and rematch_brief.
     If you choose a winner, loser_brief must help the lower-scoring worker improve its own submission on the weighted rubric. It may mention the strongest pressure points raised by the other corner, but only as optional considerations, not as a script for a rebuttal. rematch_brief must be an empty string.
     If the weighted totals truly tie, loser_brief must be an empty string and rematch_brief must give both workers shared improvement notes. Those notes may mention persuasive pressure points from the opposite corner, but both workers should still submit standalone answers rather than debate replies.
@@ -500,6 +693,9 @@ DEFAULT_EVALUATOR_TEMPLATE = textwrap.dedent(
     Body:
     {left_body}
 
+    Workspace evidence:
+    {left_evidence}
+
     RIGHT SUBMISSION
     ID: {right_submission_id}
     Lane: {right_lane_id}
@@ -508,6 +704,9 @@ DEFAULT_EVALUATOR_TEMPLATE = textwrap.dedent(
 
     Body:
     {right_body}
+
+    Workspace evidence:
+    {right_evidence}
 
     Return only JSON matching the required schema.
     """
@@ -627,6 +826,38 @@ def resilience_current_label(summary: dict[str, Any]) -> str:
     return str(current_key)
 
 
+def infer_task_mode(prompt: str, title: str | None = None) -> str:
+    haystack = " ".join(part for part in (title or "", prompt) if part).lower()
+    if any(hint in haystack for hint in PATCH_MODE_STRONG_HINTS):
+        return "patch"
+    if any(hint in haystack for hint in PROPOSAL_MODE_HINTS):
+        return "proposal"
+    if any(hint in haystack for hint in PATCH_MODE_WEAK_HINTS):
+        return "patch"
+    return "proposal"
+
+
+def task_mode_label(mode: str | None) -> str:
+    return "Patch bout" if str(mode or "proposal") == "patch" else "Proposal bout"
+
+
+def task_apply_status_label(status: str | None) -> str:
+    mapping = {
+        "not_requested": "Not requested",
+        "pending": "Pending apply",
+        "applied": "Applied to target repo",
+        "not_applied": "Not applied",
+    }
+    return mapping.get(str(status or "not_requested"), str(status or "not_requested"))
+
+
+def asymptote_current_label(payload: dict[str, Any]) -> str:
+    status = str(payload.get("status") or "OFF")
+    reason = str(payload.get("reason") or "-")
+    progress = str(payload.get("progress_text") or "-")
+    return f"{render_state_label(status)} | {reason} | {progress}"
+
+
 def resilience_guard_snapshot(summary: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
         vault = credential_vault()
@@ -718,6 +949,22 @@ def ensure_selected_resilience_profile() -> str | None:
         return resolved_key
     except VaultError:
         return None
+
+
+def ensure_live_codex_home_auth() -> None:
+    ensure_codex_home_config(LAB_HOME, [ROOT])
+    auth_payload: dict[str, Any] | None = None
+    try:
+        vault = credential_vault()
+        current_key = vault.current_account_key()
+        if current_key:
+            auth_payload = vault.account_auth_data(current_key)
+    except VaultError:
+        auth_payload = None
+    if not auth_payload:
+        auth_payload = read_json(RESILIENCE_AUTH_PATH) or read_json(LAB_HOME / "auth.json")
+    if auth_payload:
+        atomic_write_json(LAB_HOME / "auth.json", auth_payload)
 
 
 def run_resilience_profile_login(alias: str | None = None) -> str:
@@ -835,6 +1082,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             task_id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             prompt TEXT NOT NULL,
+            task_mode TEXT NOT NULL DEFAULT 'proposal',
             status TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -857,6 +1105,10 @@ def init_db(conn: sqlite3.Connection) -> None:
             evaluator_tier TEXT NOT NULL DEFAULT 'primary',
             tier_phase TEXT NOT NULL DEFAULT 'base',
             rematch_brief TEXT NOT NULL DEFAULT '',
+            apply_status TEXT NOT NULL DEFAULT 'not_requested',
+            applied_submission_id TEXT,
+            applied_at TEXT,
+            apply_notes TEXT NOT NULL DEFAULT '',
             worker_a_session_id TEXT,
             worker_b_session_id TEXT,
             evaluator_session_id TEXT
@@ -934,7 +1186,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     current_schema_version_row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     current_schema_version = int(current_schema_version_row[0]) if current_schema_version_row else 0
     for key, value in (
-        ("schema_version", "3"),
+        ("schema_version", "5"),
         ("next_task_id", "1"),
         ("next_submission_id", "1"),
         ("next_evaluation_id", "1"),
@@ -952,6 +1204,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
     ensure_schema_v3(conn, current_schema_version)
     ensure_schema_v4(conn, current_schema_version)
+    ensure_schema_v5(conn, current_schema_version)
     conn.commit()
 
 
@@ -1031,6 +1284,35 @@ def ensure_schema_v4(conn: sqlite3.Connection, current_schema_version: int) -> N
     if current_schema_version >= 4:
         return
     conn.execute("UPDATE meta SET value = '4' WHERE key = 'schema_version'")
+
+
+def ensure_schema_v5(conn: sqlite3.Connection, current_schema_version: int) -> None:
+    ensure_column(conn, "tasks", "task_mode", "task_mode TEXT NOT NULL DEFAULT 'proposal'")
+    ensure_column(conn, "tasks", "apply_status", "apply_status TEXT NOT NULL DEFAULT 'not_requested'")
+    ensure_column(conn, "tasks", "applied_submission_id", "applied_submission_id TEXT")
+    ensure_column(conn, "tasks", "applied_at", "applied_at TEXT")
+    ensure_column(conn, "tasks", "apply_notes", "apply_notes TEXT NOT NULL DEFAULT ''")
+    if current_schema_version >= 5:
+        return
+    for task in conn.execute("SELECT task_id, title, prompt, task_mode, masterpiece_locked FROM tasks").fetchall():
+        inferred_mode = infer_task_mode(str(task["prompt"] or ""), str(task["title"] or ""))
+        apply_status = "not_requested"
+        if inferred_mode == "patch" and bool(task["masterpiece_locked"]):
+            apply_status = "not_applied"
+        conn.execute(
+            """
+            UPDATE tasks
+            SET task_mode = COALESCE(NULLIF(task_mode, ''), ?),
+                apply_status = CASE
+                    WHEN apply_status IS NULL OR apply_status = '' THEN ?
+                    ELSE apply_status
+                END,
+                apply_notes = COALESCE(apply_notes, '')
+            WHERE task_id = ?
+            """,
+            (inferred_mode, apply_status, task["task_id"]),
+        )
+    conn.execute("UPDATE meta SET value = '5' WHERE key = 'schema_version'")
 
 
 def allocate_id(conn: sqlite3.Connection, meta_key: str, prefix: str) -> str:
@@ -1472,6 +1754,133 @@ def prepare_task_workspace(conn: sqlite3.Connection, lane_id: str, task_id: str)
     return workspace
 
 
+def workspace_metadata(workspace: Path) -> dict[str, Any]:
+    manifest_path = workspace / "codexlab-task.json"
+    if not manifest_path.exists():
+        return {
+            "workspace_path": str(workspace),
+            "workspace_kind": "unknown",
+            "repo_root": None,
+            "head_sha": None,
+            "fallback_reason": "missing codexlab-task.json",
+        }
+    return hydrate_workspace_metadata(manifest_path)
+
+
+def parse_git_status_line(raw_line: str) -> tuple[str, str, str | None] | None:
+    line = raw_line.rstrip()
+    if len(line) < 4:
+        return None
+    status = line[:2]
+    payload = line[3:].strip()
+    if not payload:
+        return None
+    if " -> " in payload:
+        old_path, new_path = payload.split(" -> ", 1)
+        return status, new_path.strip(), old_path.strip()
+    return status, payload, None
+
+
+def workspace_change_evidence(workspace: Path) -> dict[str, Any]:
+    metadata = workspace_metadata(workspace)
+    evidence: dict[str, Any] = {
+        "workspace_path": str(workspace),
+        "workspace_kind": metadata.get("workspace_kind"),
+        "repo_root": metadata.get("repo_root"),
+        "head_sha": metadata.get("head_sha"),
+        "fallback_reason": metadata.get("fallback_reason"),
+        "status_lines": [],
+        "changed_files": [],
+        "modified_files": [],
+        "untracked_files": [],
+        "deleted_files": [],
+        "renamed_files": [],
+        "tests_run": [],
+        "has_changes": False,
+        "workspace_summary": "No repository changes detected.",
+    }
+    if shutil.which("git") is None:
+        evidence["workspace_summary"] = "Git is unavailable, so workspace changes could not be inspected."
+        return evidence
+    result = subprocess.run(
+        ["git", "-C", str(workspace), "status", "--short", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "workspace is not a git repository"
+        evidence["workspace_summary"] = f"Workspace change inspection unavailable: {message}"
+        return evidence
+
+    status_lines = [line for line in result.stdout.splitlines() if line.strip()]
+    changed_files: list[str] = []
+    modified_files: list[str] = []
+    untracked_files: list[str] = []
+    deleted_files: list[str] = []
+    renamed_files: list[dict[str, str]] = []
+
+    for raw_line in status_lines:
+        parsed = parse_git_status_line(raw_line)
+        if parsed is None:
+            continue
+        status, path_text, previous_path = parsed
+        if path_text == "codexlab-task.json":
+            continue
+        changed_files.append(path_text)
+        if status == "??":
+            untracked_files.append(path_text)
+            continue
+        if "D" in status:
+            deleted_files.append(path_text)
+        elif "R" in status and previous_path:
+            renamed_files.append({"from": previous_path, "to": path_text})
+            modified_files.append(path_text)
+        else:
+            modified_files.append(path_text)
+
+    changed_files = sorted(dict.fromkeys(changed_files))
+    modified_files = sorted(dict.fromkeys(modified_files))
+    untracked_files = sorted(dict.fromkeys(untracked_files))
+    deleted_files = sorted(dict.fromkeys(deleted_files))
+    evidence.update(
+        {
+            "status_lines": status_lines,
+            "changed_files": changed_files,
+            "modified_files": modified_files,
+            "untracked_files": untracked_files,
+            "deleted_files": deleted_files,
+            "renamed_files": renamed_files,
+            "has_changes": bool(changed_files or deleted_files),
+        }
+    )
+    if evidence["has_changes"]:
+        fragments = []
+        if untracked_files:
+            fragments.append(f"{len(untracked_files)} new")
+        if modified_files:
+            fragments.append(f"{len(modified_files)} modified")
+        if deleted_files:
+            fragments.append(f"{len(deleted_files)} deleted")
+        evidence["workspace_summary"] = (
+            f"{len(changed_files)} file changes detected"
+            + (f" ({', '.join(fragments)})" if fragments else "")
+            + "."
+        )
+    return evidence
+
+
+def submission_runtime_and_evidence(
+    *,
+    workspace: Path,
+    runtime: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "runtime": runtime,
+        "evidence": workspace_change_evidence(workspace),
+    }
+
+
 def task_dir(task_id: str) -> Path:
     return TASKS_DIR / task_id
 
@@ -1586,20 +1995,33 @@ def session_id_from_jsonl(path: Path, *, expected_cwd: Path | None = None) -> st
     return None
 
 
+def codex_session_roots() -> list[Path]:
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for home in (LAB_HOME, LOGIN_CODEX_HOME):
+        session_root = home / "sessions"
+        key = str(session_root.resolve()) if session_root.exists() else str(session_root)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(session_root)
+    return roots
+
+
 def session_file_exists(session_id: str) -> bool:
     session_id = str(session_id or "").strip()
     if not session_id:
         return False
-    sessions_root = LOGIN_CODEX_HOME / "sessions"
-    if not sessions_root.exists():
-        return False
     candidates: list[tuple[float, Path]] = []
-    for session_path in sessions_root.rglob("rollout-*.jsonl"):
-        try:
-            stat = session_path.stat()
-        except OSError:
+    for sessions_root in codex_session_roots():
+        if not sessions_root.exists():
             continue
-        candidates.append((stat.st_mtime, session_path))
+        for session_path in sessions_root.rglob("rollout-*.jsonl"):
+            try:
+                stat = session_path.stat()
+            except OSError:
+                continue
+            candidates.append((stat.st_mtime, session_path))
     candidates.sort(key=lambda item: item[0], reverse=True)
     for _mtime, session_path in candidates[:400]:
         if session_id_from_jsonl(session_path) == session_id:
@@ -1622,18 +2044,18 @@ def run_stdout_session_id(run_output_dir: Path) -> str | None:
 
 
 def discover_session_id_from_disk(workspace: Path, started_at: str) -> str | None:
-    sessions_root = LOGIN_CODEX_HOME / "sessions"
-    if not sessions_root.exists():
-        return None
     started_dt = parse_timestamp(started_at)
     cutoff = started_dt - timedelta(minutes=5) if started_dt else None
     candidates: list[tuple[float, Path]] = []
-    for session_path in sessions_root.rglob("rollout-*.jsonl"):
-        try:
-            stat = session_path.stat()
-        except OSError:
+    for sessions_root in codex_session_roots():
+        if not sessions_root.exists():
             continue
-        candidates.append((stat.st_mtime, session_path))
+        for session_path in sessions_root.rglob("rollout-*.jsonl"):
+            try:
+                stat = session_path.stat()
+            except OSError:
+                continue
+            candidates.append((stat.st_mtime, session_path))
     candidates.sort(key=lambda item: item[0], reverse=True)
     for mtime, session_path in candidates[:200]:
         if cutoff is not None and datetime.fromtimestamp(mtime, timezone.utc) < cutoff:
@@ -1933,6 +2355,46 @@ def parse_json_object(raw: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def submission_metadata(submission: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(submission, dict):
+        return parse_json_object(submission.get("meta_json"))
+    return parse_json_object(submission["meta_json"])
+
+
+def submission_runtime_meta(submission: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    meta = submission_metadata(submission)
+    runtime = meta.get("runtime")
+    if isinstance(runtime, dict):
+        return runtime
+    if meta:
+        return meta
+    return {}
+
+
+def submission_evidence_meta(submission: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    meta = submission_metadata(submission)
+    evidence = meta.get("evidence")
+    return evidence if isinstance(evidence, dict) else {}
+
+
+def submission_evidence_prompt_block(submission: sqlite3.Row | dict[str, Any]) -> str:
+    evidence = submission_evidence_meta(submission)
+    if not evidence:
+        return "No recorded workspace evidence."
+    changed_files = evidence.get("changed_files") or []
+    deleted_files = evidence.get("deleted_files") or []
+    tests_run = evidence.get("tests_run") or []
+    lines = [
+        f"Workspace summary: {evidence.get('workspace_summary') or 'No workspace summary.'}",
+        f"Changed files: {', '.join(changed_files) if changed_files else '-'}",
+    ]
+    if deleted_files:
+        lines.append(f"Deleted files: {', '.join(deleted_files)}")
+    if tests_run:
+        lines.append(f"Tests run: {', '.join(tests_run)}")
+    return "\n".join(lines)
+
+
 def submission_stage_info(submission: dict[str, Any]) -> tuple[str, str]:
     meta = parse_json_object(submission.get("meta_json"))
     stage_slug = str(meta.get("stage_slug") or "").strip()
@@ -1999,8 +2461,10 @@ def write_task_boxing_views(
         "",
         f"Title: {task['title']}",
         f"Prompt: {task['prompt']}",
+        f"Task mode: {task_mode_label(task['task_mode'])}",
         f"Current stage: {stage_label}",
         f"Status: {'Champion confirmed' if task['masterpiece_locked'] else task['status']}",
+        f"Apply status: {task_apply_status_label(task['apply_status'])}",
         "",
         "ID legend:",
         "- T = Task",
@@ -2025,10 +2489,13 @@ def write_task_boxing_views(
             f"Champion: {lane_display_name(champion['lane_id'])}",
             f"Submission: {champion['submission_id']}",
             f"Score: {task['champion_score']}",
+            f"Apply status: {task_apply_status_label(task['apply_status'])}",
             f"Summary: {champion['summary']}",
             f"Canonical output: submissions/{champion['submission_id']}/output.md",
             f"Canonical metadata: submissions/{champion['submission_id']}/metadata.json",
         ]
+        if task["apply_notes"]:
+            champion_lines.append(f"Apply notes: {task['apply_notes']}")
         if task["masterpiece_locked"]:
             champion_lines.insert(2, "Status: Champion confirmed")
         champion_card.write_text("\n".join(champion_lines).rstrip() + "\n", encoding="utf-8")
@@ -2085,6 +2552,7 @@ def write_task_boxing_views(
 
     for submission in submissions:
         stage_slug, stage_label = submission_stage_info(submission)
+        evidence = submission_evidence_meta(submission)
         filename = (
             f"round-{int(submission['round_number']):02d}__{lane_slug(submission['lane_id'])}"
             f"__{stage_slug}__{submission['submission_id']}.md"
@@ -2101,6 +2569,8 @@ def write_task_boxing_views(
             f"Published: {bool(submission.get('published'))}",
             f"Canonical output: submissions/{submission['submission_id']}/output.md",
             f"Canonical metadata: submissions/{submission['submission_id']}/metadata.json",
+            f"Workspace summary: {evidence.get('workspace_summary') or '-'}",
+            f"Changed files: {', '.join(evidence.get('changed_files') or []) or '-'}",
         ]
         (submission_cards_dir / filename).write_text("\n".join(card_lines).rstrip() + "\n", encoding="utf-8")
         corner_dir = submissions_by_corner_dir / lane_slug(submission["lane_id"])
@@ -2232,6 +2702,7 @@ def submission_brief(conn: sqlite3.Connection, submission_id: str | None) -> dic
         return None
     row = query_submission(conn, submission_id)
     body = read_submission_body(row["artifact_path"])
+    evidence = submission_evidence_meta(row)
     return {
         "submission_id": row["submission_id"],
         "lane_id": row["lane_id"],
@@ -2243,6 +2714,8 @@ def submission_brief(conn: sqlite3.Connection, submission_id: str | None) -> dic
         "body_preview": textwrap.shorten(body.replace("\n", " "), width=180, placeholder="...") if body else "",
         "published": bool(row["published"]),
         "created_at": row["created_at"],
+        "workspace_summary": evidence.get("workspace_summary") or "",
+        "changed_files": evidence.get("changed_files") or [],
     }
 
 
@@ -2487,7 +2960,7 @@ def format_event_summary(event: dict[str, Any]) -> str:
     ts = event.get("ts", "-")
     event_type = event.get("type", "event")
     if event_type == "task_submitted":
-        return f"{ts} submit {event.get('task_id')} title={event.get('title')}"
+        return f"{ts} submit {event.get('task_id')} mode={event.get('task_mode') or 'proposal'} title={event.get('title')}"
     if event_type == "lane_reserved":
         return (
             f"{ts} reserve {lane_display_name(event.get('lane_id'))} -> {event.get('task_id')} "
@@ -2543,6 +3016,19 @@ def format_event_summary(event: dict[str, Any]) -> str:
             f"{ts} CHAMPION CONFIRMED task={event.get('task_id')} "
             f"submission={event.get('submission_id')} lane={lane_display_name(event.get('lane_id'))} score={event.get('score')}"
         )
+    if event_type == "task_applied":
+        changed = ",".join(event.get("changed_files", [])) or "-"
+        return (
+            f"{ts} applied task={event.get('task_id')} "
+            f"submission={event.get('submission_id')} lane={lane_display_name(event.get('lane_id'))} "
+            f"changed={changed}"
+        )
+    if event_type == "task_apply_failed":
+        return (
+            f"{ts} apply-failed task={event.get('task_id')} "
+            f"submission={event.get('submission_id')} lane={lane_display_name(event.get('lane_id'))} "
+            f"reason={event.get('reason')}"
+        )
     if event_type == "lane_error":
         return f"{ts} ERROR lane={lane_display_name(event.get('lane_id'))} task={event.get('task_id') or '-'} message={event.get('message')}"
     if event_type == "lane_recovered":
@@ -2570,6 +3056,16 @@ def format_event_summary(event: dict[str, Any]) -> str:
             f"{ts} quota auto-resume email={event.get('email') or '-'} "
             f"blocked={blocked} repaired={repaired}"
         )
+    if event_type == "asymptote_started":
+        return f"{ts} asymptote start message={event.get('message')}"
+    if event_type == "asymptote_stopped":
+        return f"{ts} asymptote stop message={event.get('message')}"
+    if event_type == "asymptote_pulse":
+        return f"{ts} asymptote pulse trigger={event.get('trigger')} question={event.get('question')}"
+    if event_type == "asymptote_human_note":
+        return f"{ts} asymptote human note heading={event.get('entry_heading')}"
+    if event_type == "asymptote_error":
+        return f"{ts} asymptote error trigger={event.get('trigger')} message={event.get('message')}"
     if event_type == "daemon_tick":
         return (
             f"{ts} daemon tick cycle={event.get('cycle_count')} actions={event.get('action_count')} "
@@ -2587,7 +3083,7 @@ def format_stream_event(event: dict[str, Any], *, task_id: str | None) -> str | 
     ts = compact_timestamp(event.get("ts"))
     task_ref = event.get("task_id") or "-"
     if event_type == "task_submitted":
-        return f"[{ts}] {task_ref} submitted | title={event.get('title')}"
+        return f"[{ts}] {task_ref} submitted | mode={event.get('task_mode') or 'proposal'} | title={event.get('title')}"
     if event_type == "run_started":
         mode = event.get("mode", "run")
         role = "judging" if str(mode).endswith("evaluator") else "boxing"
@@ -2614,6 +3110,13 @@ def format_stream_event(event: dict[str, Any], *, task_id: str | None) -> str | 
             f"[{ts}] {task_ref} CHAMPION CONFIRMED | "
             f"{lane_submission_ref(event.get('lane_id'), event.get('submission_id'))} score={event.get('score')}"
         )
+    if event_type == "task_applied":
+        return (
+            f"[{ts}] {task_ref} applied | "
+            f"{lane_submission_ref(event.get('lane_id'), event.get('submission_id'))} -> target repo"
+        )
+    if event_type == "task_apply_failed":
+        return f"[{ts}] {task_ref} apply blocked | {event.get('reason')}"
     if event_type == "lane_error":
         return f"[{ts}] {task_ref} ERROR {lane_display_name(event.get('lane_id'))} | {event.get('message')}"
     if event_type == "lane_recovered":
@@ -2641,6 +3144,26 @@ def format_stream_event(event: dict[str, Any], *, task_id: str | None) -> str | 
             f"[{ts}] quota auto-resume | email={event.get('email') or '-'} "
             f"blocked={blocked} repaired={repaired}"
         )
+    if event_type == "asymptote_started":
+        if task_id:
+            return None
+        return f"[{ts}] asymptote on | {event.get('message')}"
+    if event_type == "asymptote_stopped":
+        if task_id:
+            return None
+        return f"[{ts}] asymptote off | {event.get('message')}"
+    if event_type == "asymptote_pulse":
+        if task_id:
+            return None
+        return f"[{ts}] asymptote pulse | trigger={event.get('trigger')} heading={event.get('entry_heading')}"
+    if event_type == "asymptote_human_note":
+        if task_id:
+            return None
+        return f"[{ts}] asymptote human note | heading={event.get('entry_heading')}"
+    if event_type == "asymptote_error":
+        if task_id:
+            return None
+        return f"[{ts}] asymptote instability | {event.get('message')}"
     if event_type == "daemon_started":
         if task_id:
             return None
@@ -2658,6 +3181,8 @@ def task_is_finished(task: dict[str, Any]) -> bool:
 
 def task_stage_label(task: dict[str, Any]) -> str:
     if task.get("masterpiece_locked"):
+        if str(task.get("task_mode") or "proposal") == "patch":
+            return f"Champion confirmed | {task_apply_status_label(task.get('apply_status'))}"
         return "Champion confirmed"
     pair_mode = str(task.get("pair_mode") or "initial_duel")
     evaluator_tier_name = evaluator_display_label(str(task.get("evaluator_tier") or "primary"))
@@ -2684,7 +3209,13 @@ def task_stage_label(task: dict[str, Any]) -> str:
 def task_next_action(task: dict[str, Any], snapshot: dict[str, Any]) -> str:
     if task.get("masterpiece_locked"):
         champion = task.get("champion_submission")
+        apply_status = str(task.get("apply_status") or "not_requested")
         if champion:
+            if str(task.get("task_mode") or "proposal") == "patch":
+                return (
+                    f"{lane_display_name(champion['lane_id'])} champion confirmed at score {task.get('champion_score')} "
+                    f"| {task_apply_status_label(apply_status)}"
+                )
             return f"{lane_display_name(champion['lane_id'])} champion confirmed at score {task.get('champion_score')}"
         return "Task is complete"
     pair_mode = str(task.get("pair_mode") or "initial_duel")
@@ -2888,6 +3419,7 @@ def format_progress_stream(snapshot: dict[str, Any], task_id: str | None) -> str
             state_label, state_reason = task_display_state(task, snapshot)
         lines.append(f"- {task['task_id']} [{render_state_label(state_label, phase=phase)}] {task_stage_label(task)}")
         lines.append(f"  state: {render_state_label(state_label, phase=phase)} | {state_reason}")
+        lines.append(f"  mode: {task_mode_label(task.get('task_mode'))} | apply: {task_apply_status_label(task.get('apply_status'))}")
         lines.append(f"  next: {task_next_action(task, snapshot)}")
         active = task_active_summary(task, snapshot)
         if active != "-":
@@ -2902,6 +3434,7 @@ def format_progress_stream(snapshot: dict[str, Any], task_id: str | None) -> str
 def status_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
     resilience = resilience_summary()
     resilience_guard = resilience_guard_snapshot(resilience)
+    asymptote = asymptote_snapshot()
     ready_eval_tasks = [item["task"]["task_id"] for item in ready_evaluation_candidates(conn)]
     lanes = []
     for row in conn.execute("SELECT * FROM lanes ORDER BY lane_id ASC").fetchall():
@@ -2939,6 +3472,7 @@ def status_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
         "daemon": daemon_runtime_snapshot(),
         "resilience": resilience,
         "resilience_guard": resilience_guard,
+        "asymptote": asymptote,
         "summary": summary,
         "lanes": lanes,
         "tasks": tasks,
@@ -2997,6 +3531,7 @@ def dashboard_snapshot(
         "daemon": daemon,
         "resilience": base.get("resilience"),
         "resilience_guard": base.get("resilience_guard"),
+        "asymptote": base.get("asymptote"),
         "summary": summary,
         "lanes": base["lanes"],
         "tasks": tasks,
@@ -3015,6 +3550,7 @@ def dashboard_snapshot(
         "daemon": daemon,
         "resilience": base.get("resilience"),
         "resilience_guard": base.get("resilience_guard"),
+        "asymptote": base.get("asymptote"),
         "execution_state": execution_label,
         "execution_reason": execution_reason,
         "summary": summary,
@@ -3555,6 +4091,27 @@ def task_round_context(task: sqlite3.Row, lane_id: str) -> str:
     return "Produce the strongest possible answer for the current round."
 
 
+def task_mode_worker_expectations(task: sqlite3.Row) -> str:
+    if str(task["task_mode"] or "proposal") == "patch":
+        return (
+            "This is a patch bout. Make the real workspace changes needed to satisfy the brief. "
+            "Your JSON body should summarize the implemented result, but the harness will inspect actual changed files in the workspace."
+        )
+    return (
+        "This is a proposal bout. Focus on the strongest standalone answer. Workspace changes are optional and are not required to score well."
+    )
+
+
+def task_mode_evaluator_guidance(task: sqlite3.Row) -> str:
+    if str(task["task_mode"] or "proposal") == "patch":
+        return (
+            "This is a patch bout. Heavily reward submissions that made concrete workspace changes aligned with the brief, and penalize answers that are mostly prose with little or no implementation evidence."
+        )
+    return (
+        "This is a proposal bout. Judge the written submission itself; workspace evidence is secondary."
+    )
+
+
 def worker_guidance_brief(conn: sqlite3.Connection, task: sqlite3.Row, lane_id: str) -> str:
     rematch_brief = str(task["rematch_brief"] or "").strip()
     if rematch_brief:
@@ -3647,6 +4204,7 @@ def build_worker_prompt(conn: sqlite3.Connection, task: sqlite3.Row, lane_id: st
         lane_id=lane_id,
         task_id=task["task_id"],
         task_title=task["title"],
+        task_mode=task_mode_label(task["task_mode"]),
         task_prompt=task["prompt"],
         champion_summary=champion_summary,
         champion_body=champion_body,
@@ -3654,6 +4212,7 @@ def build_worker_prompt(conn: sqlite3.Connection, task: sqlite3.Row, lane_id: st
         own_previous_summary=own_previous_summary,
         own_previous_body=own_previous_body,
         round_context=task_round_context(task, lane_id),
+        mode_expectations=task_mode_worker_expectations(task),
     )
 
 
@@ -3669,6 +4228,7 @@ def build_worker_resume_prompt(conn: sqlite3.Connection, task: sqlite3.Row, lane
         Continue the same task and boxer session.
 
         Task: {task["task_id"]} | {task["title"]}
+        Task mode: {task_mode_label(task["task_mode"])}
         Corner: {lane_display_name(lane_id)}
         Round context: {task_round_context(task, lane_id)}
         Corner notes from the latest judging: {worker_guidance_brief(conn, task, lane_id)}
@@ -3678,6 +4238,8 @@ def build_worker_resume_prompt(conn: sqlite3.Connection, task: sqlite3.Row, lane
 
         Current scoring benchmark body:
         {champion_body}
+
+        {task_mode_worker_expectations(task)}
 
         Submit a standalone answer that improves your own weighted-rubric score.
         Do not write a rebuttal, dialogue, or point-by-point answer to the other corner.
@@ -3699,17 +4261,21 @@ def build_evaluator_prompt(
     return template.format(
         task_id=task["task_id"],
         task_title=task["title"],
+        task_mode=task_mode_label(task["task_mode"]),
         task_prompt=task["prompt"],
         evaluator_tier_label=evaluator_tier_label(str(task["evaluator_tier"] or "primary")),
         tie_policy=evaluator_tie_policy(task),
+        mode_scoring_guidance=task_mode_evaluator_guidance(task),
         left_submission_id=left["submission_id"],
         left_lane_id=left["lane_id"],
         left_summary=left["summary"],
         left_body=read_submission_body(left["artifact_path"]) or left["summary"],
+        left_evidence=submission_evidence_prompt_block(left),
         right_submission_id=right["submission_id"],
         right_lane_id=right["lane_id"],
         right_summary=right["summary"],
         right_body=read_submission_body(right["artifact_path"]) or right["summary"],
+        right_evidence=submission_evidence_prompt_block(right),
     )
 
 
@@ -3724,6 +4290,7 @@ def build_evaluator_resume_prompt(
         Continue the same judging session for this task.
 
         Task: {task["task_id"]} | {task["title"]}
+        Task mode: {task_mode_label(task["task_mode"])}
         Judge tier: {evaluator_tier_label(str(task["evaluator_tier"] or "primary"))}
         Weighted rubric remains:
         - correctness = 35
@@ -3732,6 +4299,7 @@ def build_evaluator_resume_prompt(
         - maintainability = 15
         - verification = 10
         Use weighted totals, not a raw sum. {evaluator_tie_policy(task)}
+        {task_mode_evaluator_guidance(task)}
         When you give winner/loser notes, focus on how each corner can improve its own standalone answer. You may mention persuasive pressure points from the opposite corner, but do not ask for a rebuttal or debate transcript.
 
         LEFT SUBMISSION
@@ -3743,6 +4311,9 @@ def build_evaluator_resume_prompt(
         Body:
         {read_submission_body(left["artifact_path"]) or left["summary"]}
 
+        Evidence:
+        {submission_evidence_prompt_block(left)}
+
         RIGHT SUBMISSION
         ID: {right["submission_id"]}
         Lane: {right["lane_id"]}
@@ -3751,6 +4322,9 @@ def build_evaluator_resume_prompt(
 
         Body:
         {read_submission_body(right["artifact_path"]) or right["summary"]}
+
+        Evidence:
+        {submission_evidence_prompt_block(right)}
 
         Return only JSON with this shape:
         {{"left_rubric":{{"correctness":0,"completeness":0,"risk":0,"maintainability":0,"verification":0}},"right_rubric":{{"correctness":0,"completeness":0,"risk":0,"maintainability":0,"verification":0}},"rationale":"...","loser_brief":"...","rematch_brief":"..."}}
@@ -3976,8 +4550,9 @@ def codex_exec_config_args(lane_home: Path) -> list[str]:
 
 def codex_exec_env() -> dict[str, str]:
     ensure_selected_resilience_profile()
+    ensure_live_codex_home_auth()
     env = os.environ.copy()
-    env["CODEX_HOME"] = str(LOGIN_CODEX_HOME)
+    env["CODEX_HOME"] = str(LAB_HOME)
     return env
 
 
@@ -4006,7 +4581,7 @@ def codex_availability_probe(timeout_seconds: float) -> dict[str, Any]:
         "--skip-git-repo-check",
         "--ephemeral",
         "--sandbox",
-        "workspace-write",
+        LIVE_CODEX_SANDBOX,
         "--cd",
         str(ROOT),
         "--output-schema",
@@ -4164,6 +4739,8 @@ def build_codex_resume_command(home: Path, output_path: Path, session_id: str) -
     return [
         REAL_CODEX,
         *codex_exec_config_args(home),
+        "-c",
+        f"sandbox_mode={json.dumps(LIVE_CODEX_SANDBOX)}",
         "--ask-for-approval",
         "never",
         "exec",
@@ -4202,7 +4779,7 @@ def worker_codex_command_spec(
         "exec",
         "--skip-git-repo-check",
         "--sandbox",
-        "workspace-write",
+        LIVE_CODEX_SANDBOX,
         "--cd",
         str(workspace),
         "--output-schema",
@@ -4243,7 +4820,7 @@ def evaluator_codex_command_spec(
         "exec",
         "--skip-git-repo-check",
         "--sandbox",
-        "workspace-write",
+        LIVE_CODEX_SANDBOX,
         "--cd",
         str(workspace),
         "--output-schema",
@@ -4341,13 +4918,16 @@ def collect_codex_worker_launch(conn: sqlite3.Connection, launch: CodexWorkerLau
             launch.lane_id,
             summary=str(payload["summary"]).strip(),
             body=str(payload["body"]).strip(),
-            meta_extra={
-                "executor": "codex",
-                "run_id": launch.handle.run_id,
-                "session_id": session_id,
-                "prompt_style": launch.prompt_style,
-                "used_resume": launch.used_resume,
-            },
+            meta_extra=submission_runtime_and_evidence(
+                workspace=launch.workspace,
+                runtime={
+                    "executor": "codex",
+                    "run_id": launch.handle.run_id,
+                    "session_id": session_id,
+                    "prompt_style": launch.prompt_style,
+                    "used_resume": launch.used_resume,
+                },
+            ),
         )
         finish_run(conn, launch.handle, "completed", 0, submission["submission_id"])
         return {
@@ -4497,11 +5077,14 @@ def codex_worker_output(
         known_session_id=known_session_id,
     )
     payload["meta"] = {
-        "executor": "codex",
-        "run_id": handle.run_id,
-        "session_id": session_id,
-        "prompt_style": prompt_style,
-        "used_resume": used_resume,
+        "runtime": {
+            "executor": "codex",
+            "run_id": handle.run_id,
+            "session_id": session_id,
+            "prompt_style": prompt_style,
+            "used_resume": used_resume,
+        },
+        "evidence": workspace_change_evidence(workspace),
     }
     return payload
 
@@ -4617,7 +5200,14 @@ def record_submission(
         "stage_label": stage_label,
     }
     if meta_extra:
-        metadata["runtime"] = meta_extra
+        runtime = meta_extra.get("runtime") if isinstance(meta_extra, dict) else None
+        evidence = meta_extra.get("evidence") if isinstance(meta_extra, dict) else None
+        if isinstance(runtime, dict):
+            metadata["runtime"] = runtime
+        elif isinstance(meta_extra, dict):
+            metadata["runtime"] = meta_extra
+        if isinstance(evidence, dict):
+            metadata["evidence"] = evidence
     (submission_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     conn.execute(
         """
@@ -4819,6 +5409,133 @@ def handle_tied_evaluation(
     }
 
 
+def set_task_apply_state(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    apply_status: str,
+    submission_id: str | None,
+    notes: str,
+) -> None:
+    applied_at = now_utc() if apply_status == "applied" else None
+    conn.execute(
+        """
+        UPDATE tasks
+        SET apply_status = ?,
+            applied_submission_id = ?,
+            applied_at = ?,
+            apply_notes = ?,
+            updated_at = ?
+        WHERE task_id = ?
+        """,
+        (apply_status, submission_id, applied_at, notes[:2000], now_utc(), task_id),
+    )
+    conn.commit()
+    sync_task_state(conn, task_id)
+
+
+def repo_conflicting_paths(repo_path: Path, paths: list[str]) -> list[str]:
+    if not paths or shutil.which("git") is None:
+        return []
+    probe = git_probe(repo_path)
+    if not probe["is_repo"]:
+        return []
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), "status", "--short", "--", *paths],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    conflicts: list[str] = []
+    for raw_line in result.stdout.splitlines():
+        parsed = parse_git_status_line(raw_line)
+        if parsed is None:
+            continue
+        _status, path_text, _previous_path = parsed
+        if path_text != "codexlab-task.json":
+            conflicts.append(path_text)
+    return sorted(dict.fromkeys(conflicts))
+
+
+def promote_patch_winner(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    winner_submission_id: str,
+    winner_lane_id: str,
+) -> dict[str, Any]:
+    task = fetch_task(conn, task_id)
+    if str(task["task_mode"] or "proposal") != "patch":
+        return {"apply_status": "not_requested", "notes": "task mode is proposal"}
+
+    workspace = existing_task_workspace(winner_lane_id, task_id)
+    if workspace is None:
+        notes = "winner workspace was not found"
+        set_task_apply_state(conn, task_id, apply_status="not_applied", submission_id=winner_submission_id, notes=notes)
+        append_event("task_apply_failed", task_id=task_id, submission_id=winner_submission_id, lane_id=winner_lane_id, reason=notes)
+        return {"apply_status": "not_applied", "notes": notes}
+
+    evidence = workspace_change_evidence(workspace)
+    changed_files = [item for item in evidence.get("changed_files") or [] if item != "codexlab-task.json"]
+    deleted_files = [item for item in evidence.get("deleted_files") or [] if item != "codexlab-task.json"]
+    touched_paths = sorted(dict.fromkeys(changed_files + deleted_files))
+    if not touched_paths:
+        notes = "winner workspace had no repo changes to apply"
+        set_task_apply_state(conn, task_id, apply_status="not_applied", submission_id=winner_submission_id, notes=notes)
+        append_event("task_apply_failed", task_id=task_id, submission_id=winner_submission_id, lane_id=winner_lane_id, reason=notes)
+        return {"apply_status": "not_applied", "notes": notes}
+
+    repo_path = target_repo_path()
+    conflicts = repo_conflicting_paths(repo_path, touched_paths)
+    if conflicts:
+        notes = f"target repo has local changes on: {', '.join(conflicts)}"
+        set_task_apply_state(conn, task_id, apply_status="not_applied", submission_id=winner_submission_id, notes=notes)
+        append_event("task_apply_failed", task_id=task_id, submission_id=winner_submission_id, lane_id=winner_lane_id, reason=notes)
+        return {"apply_status": "not_applied", "notes": notes, "conflicts": conflicts}
+
+    copied: list[str] = []
+    removed: list[str] = []
+    for relative_path in changed_files:
+        source = workspace / relative_path
+        target = repo_path / relative_path
+        if not source.exists() or source.is_dir():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        copied.append(relative_path)
+    for relative_path in deleted_files:
+        target = repo_path / relative_path
+        if target.is_dir():
+            shutil.rmtree(target)
+            removed.append(relative_path)
+        elif target.exists():
+            target.unlink()
+            removed.append(relative_path)
+
+    notes = (
+        f"applied {len(copied)} file(s)"
+        + (f" and removed {len(removed)} file(s)" if removed else "")
+        + f" from {lane_display_name(winner_lane_id)}"
+    )
+    set_task_apply_state(conn, task_id, apply_status="applied", submission_id=winner_submission_id, notes=notes)
+    append_event(
+        "task_applied",
+        task_id=task_id,
+        submission_id=winner_submission_id,
+        lane_id=winner_lane_id,
+        changed_files=copied,
+        deleted_files=removed,
+    )
+    return {
+        "apply_status": "applied",
+        "notes": notes,
+        "changed_files": copied,
+        "deleted_files": removed,
+    }
+
+
 def score_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4945,6 +5662,7 @@ def score_task(
         "pair_mode": pair_mode,
         "evaluator_tier": evaluator_tier,
         "tier_phase": task["tier_phase"],
+        "task_mode": task["task_mode"],
         "stage_slug": stage_slug,
         "stage_label": stage_label,
         "judge_label": evaluator_display_label(evaluator_tier),
@@ -5048,6 +5766,15 @@ def score_task(
     conn.commit()
     sync_task_state(conn, task_id)
 
+    apply_result: dict[str, Any] | None = None
+    if masterpiece_locked:
+        apply_result = promote_patch_winner(
+            conn,
+            task_id=task_id,
+            winner_submission_id=champion_submission_id,
+            winner_lane_id=champion_lane_id,
+        )
+
     evaluation_file = ensure_task_dirs(task_id) / "evaluations" / f"{evaluation_id}.json"
     evaluation_file.write_text(json.dumps(scorecard | {"evaluation_id": evaluation_id}, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     append_event(
@@ -5082,6 +5809,7 @@ def score_task(
         "loser_lane_id": loser["lane_id"],
         "masterpiece_locked": bool(masterpiece_locked),
         "swap_occurred": bool(swap_occurred),
+        "apply_result": apply_result,
     }
 
 
@@ -5205,7 +5933,10 @@ def run_worker_once(conn: sqlite3.Connection, lane_id: str, executor: str, exec_
                 lane_id,
                 summary=str(payload["summary"]).strip(),
                 body=str(payload["body"]).strip(),
-                meta_extra=payload.get("meta"),
+                meta_extra=submission_runtime_and_evidence(
+                    workspace=workspace,
+                    runtime=payload.get("meta") if isinstance(payload.get("meta"), dict) else {},
+                ),
             )
             finish_run(conn, handle, "completed", 0, submission["submission_id"])
             return {
@@ -5446,6 +6177,7 @@ def format_status(snapshot: dict[str, Any], task_id: str | None) -> str:
     phase = current_animation_phase()
     resilience = snapshot.get("resilience") or resilience_summary()
     resilience_guard = snapshot.get("resilience_guard") or resilience_guard_snapshot(resilience)
+    asymptote = snapshot.get("asymptote") or asymptote_snapshot()
     lines.append(f"Root: {snapshot['root']}")
     lines.append(f"DB: {snapshot['db_path']}")
     lines.append(f"Executor: {snapshot['executor']}")
@@ -5456,6 +6188,16 @@ def format_status(snapshot: dict[str, Any], task_id: str | None) -> str:
     )
     if resilience_guard.get("active"):
         lines.append(f"Resilience guard: {render_state_label('PAUSED', phase=phase)} | {resilience_guard.get('reason')}")
+    lines.append(
+        f"Asymptote: {render_state_label(str(asymptote.get('status') or 'OFF'), phase=phase)} "
+        f"| {asymptote.get('reason') or '-'}"
+    )
+    lines.append(
+        f"Asymptote pulse: {asymptote.get('progress_text') or '-'} "
+        f"| interface={asymptote.get('interface_state') or '-'}"
+    )
+    if asymptote.get("last_error"):
+        lines.append(f"Asymptote warning: {asymptote.get('last_error')}")
     lines.append("")
     lines.append("Lanes:")
     for lane in snapshot["lanes"]:
@@ -5482,9 +6224,12 @@ def format_status(snapshot: dict[str, Any], task_id: str | None) -> str:
             f"champion={lane_display_name(task['champion_lane_id']) if task['champion_lane_id'] else '-'} "
             f"published={task['published_submission_id'] or '-'} retries={task['challenger_failed_attempts']} "
             f"evals={task['total_evaluations']} swaps={task['role_swaps']} masterpiece={bool(task['masterpiece_locked'])} "
-            f"pair_mode={task.get('pair_mode')} judge={evaluator_display_label(task.get('evaluator_tier'))}"
+            f"pair_mode={task.get('pair_mode')} judge={evaluator_display_label(task.get('evaluator_tier'))} "
+            f"mode={task_mode_label(task.get('task_mode'))} apply={task_apply_status_label(task.get('apply_status'))}"
         )
         lines.append(f"  state: {render_state_label(display_state, phase=phase)} | {display_reason}")
+        if task.get("apply_notes"):
+            lines.append(f"  apply: {task['apply_notes']}")
     if not tasks:
         lines.append("- none")
     return "\n".join(lines)
@@ -5496,6 +6241,7 @@ def format_dashboard(snapshot: dict[str, Any]) -> str:
     quota_monitor = daemon_state.get("quota_monitor") or {}
     resilience = snapshot.get("resilience") or resilience_summary()
     resilience_guard = snapshot.get("resilience_guard") or resilience_guard_snapshot(resilience)
+    asymptote = snapshot.get("asymptote") or asymptote_snapshot()
     execution_label = snapshot.get("execution_state")
     execution_reason = snapshot.get("execution_reason")
     if not execution_label or not execution_reason:
@@ -5539,6 +6285,16 @@ def format_dashboard(snapshot: dict[str, Any]) -> str:
     )
     if resilience_guard.get("active"):
         lines.append(f"Resilience guard: {render_state_label('PAUSED', phase=phase)} | {resilience_guard.get('reason')}")
+    lines.append(
+        f"Asymptote: {render_state_label(str(asymptote.get('status') or 'OFF'), phase=phase)} "
+        f"| {asymptote.get('reason') or '-'}"
+    )
+    lines.append(
+        f"Horizon: {asymptote.get('progress_text') or '-'} "
+        f"| interface={asymptote.get('interface_state') or '-'}"
+    )
+    if asymptote.get("last_error"):
+        lines.append(f"Asymptote warning: {asymptote.get('last_error')}")
     lines.append("")
     lines.append("Corners and Officials:")
     for lane in snapshot["lanes"]:
@@ -5584,7 +6340,11 @@ def format_dashboard(snapshot: dict[str, Any]) -> str:
             )
             lines.append(f"  Prompt: {task['prompt_preview']}")
             lines.append(f"  Stage: {task_stage_label(task)}")
+            lines.append(f"  Mode: {task_mode_label(task.get('task_mode'))}")
             lines.append(f"  State: {render_state_label(display_state, phase=phase)} | {display_reason}")
+            lines.append(f"  Apply: {task_apply_status_label(task.get('apply_status'))}")
+            if task.get("apply_notes"):
+                lines.append(f"  Apply notes: {task['apply_notes']}")
             lines.append(
                 f"  Resolution: duel_stage={task.get('duel_stage')} pair_mode={task.get('pair_mode')} "
                 f"judge={evaluator_display_label(task.get('evaluator_tier'))} tier_phase={task.get('tier_phase')}"
@@ -5599,6 +6359,8 @@ def format_dashboard(snapshot: dict[str, Any]) -> str:
                     f"score={task['champion_score'] if task['champion_score'] is not None else '-'} "
                     f"summary={champion['summary']}"
                 )
+                if champion.get("workspace_summary"):
+                    lines.append(f"  Champion workspace: {champion['workspace_summary']}")
             else:
                 lines.append("  Champion: -")
             if challenger:
@@ -5607,6 +6369,8 @@ def format_dashboard(snapshot: dict[str, Any]) -> str:
                     f"score={task['challenger_score'] if task['challenger_score'] is not None else '-'} "
                     f"summary={challenger['summary']}"
                 )
+                if challenger.get("workspace_summary"):
+                    lines.append(f"  Challenger workspace: {challenger['workspace_summary']}")
             else:
                 lines.append("  Challenger: -")
             lines.append(f"  Queue: {queue_desc}")
@@ -5747,20 +6511,32 @@ def submit_task(conn: sqlite3.Connection, prompt: str, title: str | None = None)
         raise SystemExit("Task prompt must not be empty")
     task_id = allocate_id(conn, "next_task_id", "T")
     normalized_title = title or textwrap.shorten(normalized_prompt.replace("\n", " "), width=72, placeholder="...")
+    task_mode = infer_task_mode(normalized_prompt, normalized_title)
     created_at = now_utc()
     conn.execute(
         """
         INSERT INTO tasks(
-            task_id, title, prompt, status, created_at, updated_at,
-            masterpiece_locked, max_retry_failures, max_total_evaluations, max_role_swaps
+            task_id, title, prompt, task_mode, status, created_at, updated_at,
+            masterpiece_locked, max_retry_failures, max_total_evaluations, max_role_swaps, apply_status
         )
-        VALUES(?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?)
+        VALUES(?, ?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?, ?)
         """,
-        (task_id, normalized_title, normalized_prompt, created_at, created_at, MAX_RETRY_FAILURES, MAX_TOTAL_EVALUATIONS, MAX_ROLE_SWAPS),
+        (
+            task_id,
+            normalized_title,
+            normalized_prompt,
+            task_mode,
+            created_at,
+            created_at,
+            MAX_RETRY_FAILURES,
+            MAX_TOTAL_EVALUATIONS,
+            MAX_ROLE_SWAPS,
+            "pending" if task_mode == "patch" else "not_requested",
+        ),
     )
     base = ensure_task_dirs(task_id)
     (base / "brief.md").write_text(
-        f"# {task_id}: {normalized_title}\n\n## Prompt\n\n{normalized_prompt}\n",
+        f"# {task_id}: {normalized_title}\n\n## Task Mode\n\n{task_mode_label(task_mode)}\n\n## Prompt\n\n{normalized_prompt}\n",
         encoding="utf-8",
     )
     for lane_id in WORKER_LANES:
@@ -5768,8 +6544,8 @@ def submit_task(conn: sqlite3.Connection, prompt: str, title: str | None = None)
     conn.execute("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE task_id = ?", (now_utc(), task_id))
     conn.commit()
     sync_task_state(conn, task_id)
-    append_event("task_submitted", task_id=task_id, title=normalized_title)
-    return {"task_id": task_id, "title": normalized_title}
+    append_event("task_submitted", task_id=task_id, title=normalized_title, task_mode=task_mode)
+    return {"task_id": task_id, "title": normalized_title, "task_mode": task_mode}
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
@@ -5777,6 +6553,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     created = submit_task(conn, args.prompt, args.title)
     print(f"task_id={created['task_id']}")
     print(f"title={created['title']}")
+    print(f"task_mode={created['task_mode']}")
     conn.close()
     return 0
 
@@ -6822,6 +7599,7 @@ def format_console_snapshot(
         )
     resilience = snapshot.get("resilience") or resilience_summary()
     resilience_guard = snapshot.get("resilience_guard") or resilience_guard_snapshot(resilience)
+    asymptote = snapshot.get("asymptote") or asymptote_snapshot()
     lines.append(
         f"Resilience: auto_switch={'on' if resilience.get('auto_switch') else 'off'} "
         f"selected={resilience_current_label(resilience)} "
@@ -6829,6 +7607,17 @@ def format_console_snapshot(
     )
     if resilience_guard.get("active"):
         lines.append(f"Resilience guard: {render_state_label('PAUSED', phase=phase)} | {resilience_guard.get('reason')}")
+    asymptote_owner_pid = int(asymptote.get("owner_pid") or 0)
+    asymptote_summary = str(asymptote.get("reason") or "-")
+    if str(asymptote.get("status") or "OFF").upper() != "OFF":
+        if asymptote_owner_pid and asymptote_owner_pid != os.getpid():
+            asymptote_summary = "separate console active"
+        elif asymptote_owner_pid == os.getpid():
+            asymptote_summary = "attached to this console"
+    lines.append(
+        f"Asymptote: {render_state_label(str(asymptote.get('status') or 'OFF'), phase=phase)} "
+        f"| {asymptote_summary}"
+    )
     lines.append(f"Profiles: {resilience_counts_display(resilience.get('counts') or {})}")
     for profile in list(resilience.get("profiles") or [])[:4]:
         current_marker = " current" if profile.get("is_current") else ""
@@ -6871,8 +7660,11 @@ def format_console_snapshot(
             if not state_label or not state_reason:
                 state_label, state_reason = task_display_state(task, snapshot)
             lines.append(f"- {task['task_id']} [{render_state_label(state_label, phase=phase)}] {task_stage_label(task)}")
+            lines.append(f"  mode: {task_mode_label(task.get('task_mode'))} | apply: {task_apply_status_label(task.get('apply_status'))}")
             lines.append(f"  next: {task_next_action(task, snapshot)}")
             lines.append(f"  state: {render_state_label(state_label, phase=phase)} | {state_reason}")
+            if task.get("apply_notes"):
+                lines.append(f"  apply: {task['apply_notes']}")
             lines.append(f"  crowd: {crowd_reaction(task)}")
             scoreboard = task_scoreboard_summary(task)
             if scoreboard != "-":
@@ -6977,7 +7769,7 @@ def format_console_screen(
 ) -> list[str]:
     body = format_console_snapshot(snapshot, focus_task_id=focus_task_id)
     body_lines = wrap_console_lines(body, width)
-    help_line = "Enter submits a task | /focus T-0001 | /profile ... | /auto-switch on|off | /sync | /useage [all] | /run ... | /quit"
+    help_line = "Enter submits a task | /focus T-0001 | /status | /profile ... | /auto-switch on|off | /asymptote on|off | /sync | /useage [all] | /run ... | /quit"
     status_line = f"Status: {status_message}" if status_message else "Status: ready"
     prompt_prefix = "Prompt> "
     prompt_line = f"{prompt_prefix}{trim_console_input(input_buffer, width - len(prompt_prefix))}"
@@ -7038,7 +7830,7 @@ def console_live_panel_text(
     live_lines = [
         live_body,
         "",
-        "Commands: /focus T-0001 | /all | /refresh | /clear-tasks | /profile ... | /auto-switch on|off | /sync | /useage [all] | /run ... | /quit",
+        "Commands: /focus T-0001 | /all | /status | /refresh | /clear-tasks | /profile ... | /auto-switch on|off | /asymptote on|off | /sync | /useage [all] | /run ... | /quit",
         f"Status: {status_message or 'ready'}",
     ]
     prompt_header = ascii_panel_border("prompt", prompt_width)
@@ -7060,6 +7852,54 @@ def console_live_toolbar_text(
         status_message=status_message,
         events_limit=events_limit,
     )
+
+
+def format_asymptote_console_snapshot(payload: dict[str, Any], *, max_lines: int = 8) -> str:
+    phase = current_animation_phase()
+    lines = [
+        "Asymptote Console",
+        f"Execution: {render_state_label(str(payload.get('status') or 'OFF'), phase=phase)} | {payload.get('reason') or '-'}",
+        f"Horizon: {payload.get('progress_text') or '-'}",
+        f"Interface: {payload.get('interface_state') or '-'}",
+        f"Human anchor: {payload.get('human_anchor') or '-'}",
+        f"AI anchor: {payload.get('ai_anchor') or '-'}",
+        f"Letters: {payload.get('letters_anchor') or '-'}",
+        f"Files: {USER_PREFS_FILE.name}, {AI_PREFS_FILE.name}, {LETTERS_FILE.name}",
+    ]
+    if payload.get("last_error"):
+        lines.append(f"Warning: {payload.get('last_error')}")
+    recent = [event for event in recent_events(max_lines) if str(event.get("type", "")).startswith("asymptote_")]
+    lines.append("")
+    lines.append("Recent:")
+    if not recent:
+        lines.append("- no recent asymptote events")
+    else:
+        rendered = 0
+        for event in recent:
+            summary = format_stream_event(event, task_id=None)
+            if not summary:
+                continue
+            lines.append(f"- {summary}")
+            rendered += 1
+            if rendered >= max_lines:
+                break
+        if rendered == 0:
+            lines.append("- no recent asymptote events")
+    return "\n".join(lines)
+
+
+def asymptote_console_panel_text(*, status_message: str = "", events_limit: int = 6) -> str:
+    payload = asymptote_snapshot()
+    panel_width = console_panel_width()
+    prompt_width = console_prompt_width()
+    live_lines = [
+        format_asymptote_console_snapshot(payload, max_lines=max(1, events_limit)),
+        "",
+        "Commands: /status | /sync | /asymptote off | /quit",
+        f"Status: {status_message or 'ready'}",
+    ]
+    prompt_header = ascii_panel_border("prompt", prompt_width)
+    return "\n\n".join([render_ascii_panel("asymptote", "\n".join(live_lines), width=panel_width), prompt_header])
 
 
 def print_resilience_profiles(summary: dict[str, Any]) -> None:
@@ -7184,9 +8024,10 @@ def handle_resilience_console_command(
     *,
     allow_run: bool = True,
     allow_profile_login: bool = True,
+    prefer_external_asymptote: bool = False,
 ) -> str | None:
     text = command.strip()
-    if not text.startswith(("/profile", "/auto-switch", "/sync", "/run", "/useage", "/usage")):
+    if not text.startswith(("/profile", "/auto-switch", "/sync", "/run", "/useage", "/usage", "/asymptote")):
         return None
     try:
         parts = parse_shell_command(text)
@@ -7250,10 +8091,26 @@ def handle_resilience_console_command(
                 return "usage: /auto-switch <on|off>"
             enabled = vault.set_auto_switch(parts[1] == "on")
             return f"auto-switch={'on' if enabled else 'off'}"
+        if cmd_name == "/asymptote":
+            if len(parts) != 2 or parts[1] not in {"on", "off"}:
+                return "usage: /asymptote <on|off>"
+            if parts[1] == "on" and prefer_external_asymptote and external_asymptote_console_supported():
+                payload = asymptote_snapshot()
+                return spawn_asymptote_console(activate=not bool(payload.get("active")))
+            result = asymptote_controller().start() if parts[1] == "on" else asymptote_controller().stop()
+            return result.message
         if cmd_name == "/sync":
             synced = vault.sync_auth()
             fingerprint = synced.get("fingerprint") or {}
-            return f"sync complete account_id={fingerprint.get('account_id') or '-'}"
+            message = f"sync complete account_id={fingerprint.get('account_id') or '-'}"
+            asymptote = asymptote_snapshot()
+            if asymptote.get("active"):
+                pulse_result = asymptote_controller().sync_now()
+                if pulse_result.ok:
+                    message += " | asymptote pulse triggered"
+                elif pulse_result.message != "Asymptote inactive":
+                    message += f" | {pulse_result.message}"
+            return message
         if cmd_name in {"/useage", "/usage"}:
             if len(parts) == 1:
                 print_resilience_usage(probe_resilience_usage(all_profiles=False), all_profiles=False)
@@ -7292,6 +8149,8 @@ def handle_console_command(
     text = command.strip()
     if text in {"/quit", "/exit"}:
         return "leaving console", focus_task_id, True
+    if text == "/status":
+        return "status refreshed", focus_task_id, False
     if text == "/refresh":
         return "refreshed", focus_task_id, False
     if text == "/all":
@@ -7305,8 +8164,8 @@ def handle_console_command(
         return "usage: /focus T-0001", focus_task_id, False
     if text == "/help":
         return (
-            "commands: /focus T-0001, /all, /refresh, /clear-tasks, /profile ..., "
-            "/auto-switch on|off, /sync, /useage [all], /run ..., /quit",
+            "commands: /focus T-0001, /all, /status, /refresh, /clear-tasks, /profile ..., "
+            "/auto-switch on|off, /asymptote on|off, /sync, /useage [all], /run ..., /quit",
             focus_task_id,
             False,
         )
@@ -7315,6 +8174,7 @@ def handle_console_command(
 
 def cmd_console(args: argparse.Namespace) -> int:
     ensure_layout()
+    ensure_selected_resilience_profile()
     focus_task_id = args.task_id
     selected_profile = resilience_summary().get("current_account_key")
     status_message = (
@@ -7324,86 +8184,150 @@ def cmd_console(args: argparse.Namespace) -> int:
     )
     live_panel_mode = advanced_prompt_available()
 
-    while True:
-        conn = connect()
-        snapshot = dashboard_snapshot(conn, focus_task_id, events_limit=args.events_limit)
-        conn.close()
-        startup_message = console_startup_daemon(
-            snapshot,
-            executor=args.executor,
-            exec_timeout=args.exec_timeout,
-            interval=args.interval,
-        )
-        if startup_message:
-            status_message = startup_message
+    try:
+        while True:
             conn = connect()
             snapshot = dashboard_snapshot(conn, focus_task_id, events_limit=args.events_limit)
             conn.close()
-
-        if not live_panel_mode:
-            print(format_console_snapshot(snapshot, focus_task_id=focus_task_id))
-            print("")
-            print("Commands: /focus T-0001 | /all | /refresh | /clear-tasks | /profile ... | /auto-switch on|off | /sync | /run ... | /quit")
-            print(f"Status: {status_message or 'ready'}")
-            print("")
-
-        try:
-            text = read_prompt_line(
-                "",
-                session_name="console",
-                refresh_interval=max(float(args.interval), 0.25),
-                message=(
-                    (lambda: console_live_panel_text(focus_task_id, status_message=status_message, events_limit=args.events_limit))
-                    if live_panel_mode
-                    else None
-                ),
-                bottom_toolbar=(console_prompt_bottom_border if live_panel_mode else None),
-                style=(CONSOLE_PROMPT_STYLE if live_panel_mode else None),
-                completer=(CONSOLE_SLASH_COMPLETER if live_panel_mode else None),
-                complete_while_typing=live_panel_mode,
+            startup_message = console_startup_daemon(
+                snapshot,
+                executor=args.executor,
+                exec_timeout=args.exec_timeout,
+                interval=args.interval,
             )
-        except EOFError:
-            return 0
-        except KeyboardInterrupt:
-            print("")
-            return 0
+            if startup_message:
+                status_message = startup_message
+                conn = connect()
+                snapshot = dashboard_snapshot(conn, focus_task_id, events_limit=args.events_limit)
+                conn.close()
 
-        text = text.strip()
-        if not text:
-            status_message = "refreshed"
-            continue
-        if text.startswith("/"):
-            if text == "/clear-tasks":
-                payload = clear_tasks_runtime()
-                focus_task_id = None
-                status_message = (
-                    f"cleared tasks | tasks={payload['counts']['tasks']} "
-                    f"runs={payload['counts']['runs']}"
+            if not live_panel_mode:
+                print(format_console_snapshot(snapshot, focus_task_id=focus_task_id))
+                print("")
+                print("Commands: /focus T-0001 | /all | /status | /refresh | /clear-tasks | /profile ... | /auto-switch on|off | /asymptote on|off | /sync | /run ... | /quit")
+                print(f"Status: {status_message or 'ready'}")
+                print("")
+
+            try:
+                text = read_prompt_line(
+                    "",
+                    session_name="console",
+                    refresh_interval=max(float(args.interval), 0.25),
+                    message=(
+                        (lambda: console_live_panel_text(focus_task_id, status_message=status_message, events_limit=args.events_limit))
+                        if live_panel_mode
+                        else None
+                    ),
+                    bottom_toolbar=(console_prompt_bottom_border if live_panel_mode else None),
+                    style=(CONSOLE_PROMPT_STYLE if live_panel_mode else None),
+                    completer=(CONSOLE_SLASH_COMPLETER if live_panel_mode else None),
+                    complete_while_typing=live_panel_mode,
                 )
-                continue
-            resilience_message = handle_resilience_console_command(text)
-            if resilience_message is not None:
-                status_message = resilience_message
-                continue
-            status_message, focus_task_id, should_exit = handle_console_command(
-                text,
-                focus_task_id=focus_task_id,
-            )
-            if should_exit:
+            except EOFError:
                 return 0
-            continue
+            except KeyboardInterrupt:
+                print("")
+                return 0
 
-        conn = connect()
-        created = submit_task(conn, text, None)
-        conn.close()
-        daemon_result = ensure_live_daemon(args.executor, args.exec_timeout, args.interval)
-        daemon_bits = []
-        if daemon_result.get("started"):
-            daemon_bits.append(f"daemon {daemon_result['pid']} started")
-        elif daemon_result.get("already_running"):
-            daemon_bits.append(f"daemon {daemon_result['pid']} reused")
-        focus_task_id = created["task_id"]
-        status_message = f"submitted {created['task_id']}" + (f" | {'; '.join(daemon_bits)}" if daemon_bits else "")
+            text = text.strip()
+            if not text:
+                status_message = "refreshed"
+                continue
+            if text.startswith("/"):
+                if text == "/clear-tasks":
+                    payload = clear_tasks_runtime()
+                    focus_task_id = None
+                    status_message = (
+                        f"cleared tasks | tasks={payload['counts']['tasks']} "
+                        f"runs={payload['counts']['runs']}"
+                    )
+                    continue
+                resilience_message = handle_resilience_console_command(text, prefer_external_asymptote=True)
+                if resilience_message is not None:
+                    status_message = resilience_message
+                    continue
+                status_message, focus_task_id, should_exit = handle_console_command(
+                    text,
+                    focus_task_id=focus_task_id,
+                )
+                if should_exit:
+                    return 0
+                continue
+
+            conn = connect()
+            created = submit_task(conn, text, None)
+            conn.close()
+            daemon_result = ensure_live_daemon(args.executor, args.exec_timeout, args.interval)
+            daemon_bits = []
+            if daemon_result.get("started"):
+                daemon_bits.append(f"daemon {daemon_result['pid']} started")
+            elif daemon_result.get("already_running"):
+                daemon_bits.append(f"daemon {daemon_result['pid']} reused")
+            focus_task_id = created["task_id"]
+            status_message = f"submitted {created['task_id']}" + (f" | {'; '.join(daemon_bits)}" if daemon_bits else "")
+    finally:
+        stop_owned_asymptote_engine()
+
+
+def cmd_asymptote_console(args: argparse.Namespace) -> int:
+    ensure_layout()
+    status_message = "asymptote console ready"
+    if args.activate:
+        result = asymptote_controller().start()
+        status_message = result.message
+    elif args.attach:
+        status_message = "attached to existing asymptote interface"
+
+    live_panel_mode = advanced_prompt_available()
+    try:
+        while True:
+            payload = asymptote_snapshot()
+
+            if not live_panel_mode:
+                print(format_asymptote_console_snapshot(payload))
+                print("")
+                print("Commands: /status | /sync | /asymptote off | /quit")
+                print(f"Status: {status_message or 'ready'}")
+                print("")
+
+            try:
+                text = read_prompt_line(
+                    "",
+                    session_name="asymptote-console",
+                    refresh_interval=1.0,
+                    message=((lambda: asymptote_console_panel_text(status_message=status_message, events_limit=args.events_limit)) if live_panel_mode else None),
+                    bottom_toolbar=(console_prompt_bottom_border if live_panel_mode else None),
+                    style=(CONSOLE_PROMPT_STYLE if live_panel_mode else None),
+                )
+            except EOFError:
+                return 0
+            except KeyboardInterrupt:
+                print("")
+                return 0
+
+            text = text.strip()
+            if not text or text == "/status":
+                status_message = "status refreshed"
+                continue
+            if text in {"/quit", "/exit"}:
+                return 0
+            if text == "/sync":
+                result = asymptote_controller().sync_now()
+                status_message = result.message
+                continue
+            if text == "/asymptote off":
+                result = asymptote_controller().stop()
+                status_message = result.message
+                if result.ok:
+                    return 0
+                continue
+            if text.startswith("/"):
+                status_message = "commands: /status, /sync, /asymptote off, /quit"
+                continue
+            result = asymptote_controller().record_human_note(text)
+            status_message = result.message
+    finally:
+        stop_owned_asymptote_engine()
 
 
 def cmd_tui(args: argparse.Namespace) -> int:
@@ -7415,6 +8339,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
         raise SystemExit(f"tui requires curses support: {exc}") from exc
 
     ensure_layout()
+    ensure_selected_resilience_profile()
 
     def _run(stdscr: Any) -> int:
         try:
@@ -7516,6 +8441,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
                             text,
                             allow_run=False,
                             allow_profile_login=False,
+                            prefer_external_asymptote=False,
                         )
                         if resilience_message is not None:
                             status_message = resilience_message
@@ -7573,10 +8499,13 @@ def cmd_tui(args: argparse.Namespace) -> int:
         return int(curses.wrapper(_run))
     except KeyboardInterrupt:
         return 0
+    finally:
+        stop_owned_asymptote_engine()
 
 
 def cmd_codex(args: argparse.Namespace) -> int:
     ensure_layout()
+    ensure_live_codex_home_auth()
     env = os.environ.copy()
     env["CODEX_HOME"] = str(LAB_HOME)
     command = [
@@ -7584,7 +8513,7 @@ def cmd_codex(args: argparse.Namespace) -> int:
         "--cd",
         str(ROOT),
         "--sandbox",
-        "workspace-write",
+        LIVE_CODEX_SANDBOX,
         "--ask-for-approval",
         "never",
         *args.extra_args,
@@ -7767,6 +8696,12 @@ def build_parser() -> argparse.ArgumentParser:
     tui.add_argument("--events-limit", type=int, default=DEFAULT_EVENTS_LIMIT)
     tui.set_defaults(func=cmd_tui)
 
+    asymptote_console = subparsers.add_parser("asymptote-console", help="Open the dedicated Asymptote console")
+    asymptote_console.add_argument("--activate", action="store_true", help="Start the asymptote engine before opening the console")
+    asymptote_console.add_argument("--attach", action="store_true", help="Open the console without starting a new engine")
+    asymptote_console.add_argument("--events-limit", type=int, default=DEFAULT_EVENTS_LIMIT)
+    asymptote_console.set_defaults(func=cmd_asymptote_console)
+
     codex = subparsers.add_parser("codex", help="Launch stock Codex inside the lab workspace")
     codex.add_argument("extra_args", nargs=argparse.REMAINDER)
     codex.set_defaults(func=cmd_codex)
@@ -7792,6 +8727,7 @@ CLI_COMMANDS = {
     "clear-tasks",
     "watch",
     "tui",
+    "asymptote-console",
     "codex",
 }
 

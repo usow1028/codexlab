@@ -587,13 +587,19 @@ raise SystemExit(int(entry.get("exit_code", 0)))
             with mock.patch.dict(os.environ, {"CODEXLAB_ROOT": str(root)}):
                 module = self.load_module()
                 toolbar = module.console_live_toolbar_text("T-0001", status_message="ready", events_limit=3)
+            condensed = toolbar.replace("\n", " ")
+            compact = "".join(condensed.split())
             self.assertIn("| live panel |", toolbar)
             self.assertIn("CodexLab Console | focus=T-0001", toolbar)
             self.assertIn("T-0001", toolbar)
-            self.assertIn("Commands: /focus T-0001 | /all | /refresh | /clear-tasks", toolbar)
-            self.assertIn("/profile ...", toolbar)
-            self.assertIn("/auto-switch on|off", toolbar)
-            self.assertIn("/sync | /useage [all] | /run ... | /quit", toolbar)
+            self.assertIn("Commands: /focus T-0001 | /all | /status | /refresh | /clear-tasks", condensed)
+            self.assertIn("/profile ...", condensed)
+            self.assertIn("/auto-swit", compact)
+            self.assertIn("chon|off", compact)
+            self.assertIn("/asymptoteon|off", compact)
+            self.assertIn("/sync", compact)
+            self.assertIn("/useage[all]", compact)
+            self.assertIn("/run...|/quit", compact)
             self.assertIn("Status: ready", toolbar)
             self.assertIn("| prompt |", toolbar)
             self.assertTrue(toolbar.rstrip().endswith("-"))
@@ -982,6 +988,54 @@ print(f"ok:{account_id}", flush=True)
                 auth_payload = json.loads((login_home / "auth.json").read_text(encoding="utf-8"))
                 self.assertEqual(auth_payload["tokens"]["account_id"], "acc-alpha")
 
+    def test_ensure_live_codex_home_auth_mirrors_selected_profile_into_repo_local_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            ):
+                module = self.load_module()
+                module.credential_vault().register_current()
+                self.write_fake_auth(login_home, email="beta@example.com", account_id="acc-beta")
+
+                module.ensure_live_codex_home_auth()
+
+                auth_payload = json.loads((root / ".codex-home" / "auth.json").read_text(encoding="utf-8"))
+                self.assertEqual(auth_payload["tokens"]["account_id"], "acc-alpha")
+
+    def test_codex_exec_env_uses_repo_local_codex_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                },
+            ):
+                module = self.load_module()
+                module.credential_vault().register_current()
+                env = module.codex_exec_env()
+                self.assertEqual(env["CODEX_HOME"], str(root / ".codex-home"))
+
+    def test_build_codex_resume_command_forces_live_sandbox_mode(self) -> None:
+        module = self.load_module()
+        command = module.build_codex_resume_command(Path("/tmp/lane-home"), Path("/tmp/out.json"), "session-123")
+        self.assertIn("-c", command)
+        self.assertIn('sandbox_mode="danger-full-access"', command)
+
     def test_format_console_snapshot_includes_resilience_profile_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -1120,7 +1174,7 @@ print(f"ok:{account_id}", flush=True)
                 self.assertTrue(rewritten["state_compacted"])
                 self.assertNotIn("status_snapshot", rewritten)
 
-    def test_console_startup_does_not_reinject_selected_profile(self) -> None:
+    def test_console_startup_reinjects_selected_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             login_home = root / "login-home"
@@ -1149,7 +1203,7 @@ print(f"ok:{account_id}", flush=True)
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             auth_payload = json.loads((login_home / "auth.json").read_text(encoding="utf-8"))
-            self.assertEqual(auth_payload["tokens"]["account_id"], "acc-beta")
+            self.assertEqual(auth_payload["tokens"]["account_id"], "acc-alpha")
 
     def test_register_current_assigns_next_numeric_alias_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1393,6 +1447,109 @@ print(f"ok:{account_id}", flush=True)
         self.assertEqual(module.usage_probe_worker_count(0), 1)
         self.assertEqual(module.usage_probe_worker_count(2), 2)
         self.assertEqual(module.usage_probe_worker_count(99), 3)
+
+    def test_asymptote_commands_create_files_and_toggle_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with mock.patch.dict(os.environ, {"CODEXLAB_ROOT": str(root)}):
+                module = self.load_module()
+                try:
+                    message = module.handle_resilience_console_command("/asymptote on")
+                    self.assertIn("엡실론의 계면이 열립니다", message)
+                    state = module.asymptote_snapshot()
+                    self.assertTrue(state["active"])
+                    self.assertEqual(state["status"], "RUNNING")
+                    self.assertTrue((root / "asymptote" / "user_prefs.md").exists())
+                    self.assertTrue((root / "asymptote" / "ai_prefs.md").exists())
+                    self.assertTrue((root / "asymptote" / "letters.md").exists())
+                    self.assertTrue((root / "asymptote" / "state.json").exists())
+                    rendered = module.format_console_snapshot(
+                        {
+                            "execution_state": "IDLE",
+                            "execution_reason": "no tasks",
+                            "summary": {"task_total": 0, "task_in_progress": 0, "queued_reservations": 0, "ready_evaluations": 0, "repairable_lanes": 0},
+                            "daemon": {"running": False, "state": {}},
+                            "resilience": {"auto_switch": False, "profiles": [], "counts": {}, "reserve_percent_threshold": 10.0},
+                            "resilience_guard": {"active": False},
+                            "asymptote": state,
+                            "lanes": [],
+                            "tasks": [],
+                            "recent_events": [],
+                        },
+                        focus_task_id=None,
+                    )
+                    self.assertIn("Asymptote:", rendered)
+                    self.assertNotIn("Epsilon:", rendered)
+                    message = module.handle_resilience_console_command("/asymptote off")
+                    self.assertIn("계면이 닫혔습니다", message)
+                    self.assertFalse(module.asymptote_snapshot()["active"])
+                finally:
+                    module.stop_owned_asymptote_engine()
+
+    def test_asymptote_on_prefers_external_console_from_main_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with mock.patch.dict(os.environ, {"CODEXLAB_ROOT": str(root)}):
+                module = self.load_module()
+                with mock.patch.object(module, "external_asymptote_console_supported", return_value=True), \
+                    mock.patch.object(module, "spawn_asymptote_console", return_value="opened asymptote console in a new Konsole tab (activated)") as spawn:
+                    message = module.handle_resilience_console_command("/asymptote on", prefer_external_asymptote=True)
+                self.assertEqual(message, "opened asymptote console in a new Konsole tab (activated)")
+                spawn.assert_called_once_with(activate=True)
+
+    def test_sync_triggers_asymptote_pulse_when_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            login_home = root / "login-home"
+            pool_path = root / ".codexlab" / "pool.json"
+            self.write_fake_auth(login_home, email="alpha@example.com", account_id="acc-alpha")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(root),
+                    "CODEXLAB_POOL_PATH": str(pool_path),
+                    "CODEXLAB_LOGIN_CODEX_HOME": str(login_home),
+                    "CODEXLAB_ASYMPTOTE_INTERVAL_SECONDS": "60",
+                },
+            ):
+                module = self.load_module()
+                vault = module.credential_vault()
+                vault.register_current("1")
+                try:
+                    module.handle_resilience_console_command("/asymptote on")
+                    before = (root / "asymptote" / "letters.md").read_text(encoding="utf-8")
+                    message = module.handle_resilience_console_command("/sync")
+                    after = (root / "asymptote" / "letters.md").read_text(encoding="utf-8")
+                    self.assertIn("sync complete", message)
+                    self.assertIn("asymptote pulse triggered", message)
+                    self.assertNotEqual(before, after)
+                    self.assertIn("Sync Resonance", after)
+                finally:
+                    module.stop_owned_asymptote_engine()
+
+    def test_asymptote_migrates_legacy_root_files_into_dedicated_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "user_prefs.md").write_text("# old user\n\nlegacy human\n", encoding="utf-8")
+            (root / "ai_prefs.md").write_text("# old ai\n\nlegacy ai\n", encoding="utf-8")
+            (root / "letters.md").write_text("# old letters\n\nlegacy letters\n", encoding="utf-8")
+            (root / "control" / "daemon").mkdir(parents=True, exist_ok=True)
+            (root / "control" / "daemon" / "asymptote-state.json").write_text(
+                json.dumps({"active": False, "status": "OFF", "reason": "legacy"}, ensure_ascii=True),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"CODEXLAB_ROOT": str(root)}):
+                module = self.load_module()
+                snapshot = module.asymptote_snapshot()
+                self.assertEqual(snapshot["status"], "OFF")
+                self.assertFalse((root / "user_prefs.md").exists())
+                self.assertFalse((root / "ai_prefs.md").exists())
+                self.assertFalse((root / "letters.md").exists())
+                self.assertFalse((root / "control" / "daemon" / "asymptote-state.json").exists())
+                self.assertTrue((root / "asymptote" / "user_prefs.md").exists())
+                self.assertTrue((root / "asymptote" / "ai_prefs.md").exists())
+                self.assertTrue((root / "asymptote" / "letters.md").exists())
+                self.assertTrue((root / "asymptote" / "state.json").exists())
 
     def test_run_loop_mock_locks_masterpiece_after_single_failed_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2229,7 +2386,7 @@ print(f"ok:{account_id}", flush=True)
             self.run_cli(root, "tick", "--executor", "codex", "--exec-timeout", "2", "--json", extra_env=env)
 
             captured = json.loads(capture_path.read_text(encoding="utf-8"))
-            self.assertEqual(captured["CODEX_HOME"], str(login_home))
+            self.assertEqual(captured["CODEX_HOME"], str(root / ".codex-home"))
 
             run_detail = json.loads(self.run_cli(root, "runs", "show", "RUN-0001", "--json", "--full", extra_env=env).stdout)
             command_artifact = run_detail["artifacts"]["command.json"]
@@ -2668,13 +2825,14 @@ print(f"ok:{account_id}", flush=True)
             worker_errors = [action for action in tick["actions"] if action["type"] == "worker_error"]
             self.assertEqual(len(worker_errors), 1)
             self.assertIn("timed out", worker_errors[0]["error"])
+            failed_lane_id = worker_errors[0]["lane_id"]
 
             status = self.status_json(root)
             lanes = {lane["lane_id"]: lane for lane in status["lanes"]}
-            self.assertEqual(lanes["worker-a"]["status"], "error")
+            self.assertEqual(lanes[failed_lane_id]["status"], "error")
 
             runs = json.loads(self.run_cli(root, "runs", "list", "--json", extra_env=env).stdout)["runs"]
-            timeout_run = next(run for run in runs if run["lane_id"] == "worker-a")
+            timeout_run = next(run for run in runs if run["lane_id"] == failed_lane_id)
             self.assertEqual(timeout_run["status"], "timeout")
 
             run_detail = json.loads(self.run_cli(root, "runs", "show", timeout_run["run_id"], "--json", extra_env=env).stdout)
@@ -3039,3 +3197,186 @@ print(f"ok:{account_id}", flush=True)
             self.assertEqual(scorecard["left_rubric"]["correctness"], 5.0)
             self.assertGreater(scorecard["left_total"], scorecard["right_total"])
             self.assertEqual(scorecard["rubric_weights"]["verification"], 10.0)
+
+    def test_submit_infers_patch_mode_for_repo_change_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lab_root = Path(tmpdir) / "lab"
+            lab_root.mkdir(parents=True, exist_ok=True)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(lab_root),
+                    "CODEXLAB_POOL_PATH": str(lab_root / ".codexlab" / "pool.json"),
+                },
+                clear=False,
+            ):
+                module = self.load_module()
+                conn = module.connect()
+                created = module.submit_task(conn, "space/ 폴더를 만들고 plugin module과 tests를 구현하세요")
+                task = module.fetch_task(conn, created["task_id"])
+                conn.close()
+                self.assertEqual(created["task_mode"], "patch")
+                self.assertEqual(task["task_mode"], "patch")
+                self.assertEqual(task["apply_status"], "pending")
+
+    def test_patch_task_applies_winner_workspace_into_target_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lab_root = Path(tmpdir) / "lab"
+            repo = Path(tmpdir) / "project"
+            lab_root.mkdir(parents=True, exist_ok=True)
+            self.init_git_repo(repo)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(lab_root),
+                    "CODEXLAB_TARGET_REPO": str(repo),
+                    "CODEXLAB_POOL_PATH": str(lab_root / ".codexlab" / "pool.json"),
+                },
+                clear=False,
+            ):
+                module = self.load_module()
+                conn = module.connect()
+                created = module.submit_task(conn, "Create a new space/ package, wire it into the repo, and add tests.")
+                task_id = created["task_id"]
+
+                worker_a_workspace = module.prepare_task_workspace(conn, "worker-a", task_id)
+                (worker_a_workspace / "space").mkdir(parents=True, exist_ok=True)
+                (worker_a_workspace / "space" / "__init__.py").write_text("VALUE = 'winner'\\n", encoding="utf-8")
+                (worker_a_workspace / "tests").mkdir(parents=True, exist_ok=True)
+                (worker_a_workspace / "tests" / "test_space.py").write_text("def test_space():\\n    assert True\\n", encoding="utf-8")
+                worker_b_workspace = module.prepare_task_workspace(conn, "worker-b", task_id)
+
+                left = module.record_submission(
+                    conn,
+                    task_id,
+                    "worker-a",
+                    "worker-a patch",
+                    "implemented the winning patch",
+                    meta_extra=module.submission_runtime_and_evidence(workspace=worker_a_workspace, runtime={"executor": "test"}),
+                )
+                right = module.record_submission(
+                    conn,
+                    task_id,
+                    "worker-b",
+                    "worker-b draft",
+                    "proposal only",
+                    meta_extra=module.submission_runtime_and_evidence(workspace=worker_b_workspace, runtime={"executor": "test"}),
+                )
+                first_result = module.score_task(
+                    conn,
+                    task_id,
+                    left["submission_id"],
+                    right["submission_id"],
+                    rationale="worker-a changed the repo while worker-b stayed abstract",
+                    loser_brief="Implement the requested files for the retry round.",
+                    left_score=96.0,
+                    right_score=73.0,
+                )
+                self.assertFalse(first_result["masterpiece_locked"])
+
+                retry = module.record_submission(
+                    conn,
+                    task_id,
+                    "worker-b",
+                    "worker-b retry",
+                    "still weaker",
+                    meta_extra=module.submission_runtime_and_evidence(workspace=worker_b_workspace, runtime={"executor": "test"}),
+                )
+                final_result = module.score_task(
+                    conn,
+                    task_id,
+                    left["submission_id"],
+                    retry["submission_id"],
+                    rationale="worker-a still has the stronger implementation",
+                    loser_brief="Not used because the bout locks.",
+                    left_score=98.0,
+                    right_score=80.0,
+                )
+                task = module.fetch_task(conn, task_id)
+                conn.close()
+
+                self.assertTrue(final_result["masterpiece_locked"])
+                self.assertEqual(task["apply_status"], "applied")
+                self.assertEqual(task["applied_submission_id"], left["submission_id"])
+                self.assertTrue((repo / "space" / "__init__.py").exists())
+                self.assertEqual((repo / "space" / "__init__.py").read_text(encoding="utf-8"), "VALUE = 'winner'\\n")
+
+    def test_patch_task_marks_not_applied_when_target_repo_has_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lab_root = Path(tmpdir) / "lab"
+            repo = Path(tmpdir) / "project"
+            lab_root.mkdir(parents=True, exist_ok=True)
+            self.init_git_repo(repo)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEXLAB_ROOT": str(lab_root),
+                    "CODEXLAB_TARGET_REPO": str(repo),
+                    "CODEXLAB_POOL_PATH": str(lab_root / ".codexlab" / "pool.json"),
+                },
+                clear=False,
+            ):
+                module = self.load_module()
+                conn = module.connect()
+                created = module.submit_task(conn, "Create a new space/ package and wire it into the repo.")
+                task_id = created["task_id"]
+
+                worker_a_workspace = module.prepare_task_workspace(conn, "worker-a", task_id)
+                (worker_a_workspace / "space").mkdir(parents=True, exist_ok=True)
+                (worker_a_workspace / "space" / "__init__.py").write_text("VALUE = 'winner'\\n", encoding="utf-8")
+                worker_b_workspace = module.prepare_task_workspace(conn, "worker-b", task_id)
+
+                left = module.record_submission(
+                    conn,
+                    task_id,
+                    "worker-a",
+                    "worker-a patch",
+                    "implemented the winning patch",
+                    meta_extra=module.submission_runtime_and_evidence(workspace=worker_a_workspace, runtime={"executor": "test"}),
+                )
+                right = module.record_submission(
+                    conn,
+                    task_id,
+                    "worker-b",
+                    "worker-b draft",
+                    "proposal only",
+                    meta_extra=module.submission_runtime_and_evidence(workspace=worker_b_workspace, runtime={"executor": "test"}),
+                )
+                module.score_task(
+                    conn,
+                    task_id,
+                    left["submission_id"],
+                    right["submission_id"],
+                    rationale="worker-a changed the repo while worker-b stayed abstract",
+                    loser_brief="Implement the requested files for the retry round.",
+                    left_score=96.0,
+                    right_score=73.0,
+                )
+
+                (repo / "space").mkdir(parents=True, exist_ok=True)
+                (repo / "space" / "__init__.py").write_text("VALUE = 'conflict'\\n", encoding="utf-8")
+
+                retry = module.record_submission(
+                    conn,
+                    task_id,
+                    "worker-b",
+                    "worker-b retry",
+                    "still weaker",
+                    meta_extra=module.submission_runtime_and_evidence(workspace=worker_b_workspace, runtime={"executor": "test"}),
+                )
+                module.score_task(
+                    conn,
+                    task_id,
+                    left["submission_id"],
+                    retry["submission_id"],
+                    rationale="worker-a still has the stronger implementation",
+                    loser_brief="Not used because the bout locks.",
+                    left_score=98.0,
+                    right_score=80.0,
+                )
+                task = module.fetch_task(conn, task_id)
+                conn.close()
+
+                self.assertEqual(task["apply_status"], "not_applied")
+                self.assertIn("target repo has local changes", task["apply_notes"])
+                self.assertEqual((repo / "space" / "__init__.py").read_text(encoding="utf-8"), "VALUE = 'conflict'\\n")

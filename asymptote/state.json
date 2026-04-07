@@ -1,0 +1,20 @@
+{
+  "active": false,
+  "owner_pid": 0,
+  "interval_seconds": 3600.0,
+  "status": "OFF",
+  "reason": "\uada4\uc801\uc774 \ud3c9\ud589\uc73c\ub85c \ub3cc\uc544\uac11\ub2c8\ub2e4. \uacc4\uba74\uc774 \ub2eb\ud614\uc2b5\ub2c8\ub2e4.",
+  "started_at": null,
+  "last_heartbeat": null,
+  "last_scan_at": null,
+  "last_pulse_at": null,
+  "last_trigger": null,
+  "last_error": "",
+  "next_pulse_at": null,
+  "human_anchor": "-",
+  "ai_anchor": "-",
+  "letters_anchor": "-",
+  "last_letter_path": "",
+  "last_letter_excerpt": "-",
+  "interface_state": "closed"
+}

@@ -2,6 +2,7 @@ You are {lane_id}, a CodexLab worker agent.
 
 Task ID: {task_id}
 Title: {task_title}
+Task mode: {task_mode}
 
 Primary task brief:
 {task_prompt}
@@ -23,6 +24,9 @@ Your latest submission body:
 
 Round context:
 {round_context}
+
+Mode expectations:
+{mode_expectations}
 
 Instructions:
 - Produce the strongest possible standalone answer for the task.

@@ -19,6 +19,7 @@ CodexLab is a local control plane for a `2 workers + 1 evaluator` Codex harness.
 
 The staged delivery plan lives in [docs/project-plan.md](/home/usow/codexlab/docs/project-plan.md).
 Daily operations and release smoke steps live in [docs/OPERATIONS.md](/home/usow/codexlab/docs/OPERATIONS.md).
+Failure taxonomy and rare-case definitions live in [docs/FAILURE_CATEGORIES.md](/home/usow/codexlab/docs/FAILURE_CATEGORIES.md).
 
 Stage 1 adds:
 
@@ -92,7 +93,7 @@ codexlab doctor
 ```
 
 `codexlab doctor` bootstraps the repo-local `.codex-home/config.toml` and validates the runtime layout for a fresh clone.
-For live `codex` lanes, CodexLab uses your authenticated Codex home from `~/.codex` by default. If your login lives elsewhere, export `CODEXLAB_LOGIN_CODEX_HOME=/path/to/codex-home` before running `codexlab`.
+For live `codex` lanes, CodexLab now keeps mutable Codex runtime state inside the repo-local `.codex-home/` while mirroring authentication from your selected or authenticated stock Codex home. If your login lives somewhere other than `~/.codex`, export `CODEXLAB_LOGIN_CODEX_HOME=/path/to/codex-home` before running `codexlab`.
 
 If you do not want shell rc changes, install the wrapper only:
 
@@ -163,21 +164,26 @@ Task artifacts now also generate readable boxing companion files beside the cano
 - `recover --apply --restart-daemon` can relaunch the background daemon after repair, again reusing explicit runtime flags or the last daemon state when available.
 - `codexlab "..."` still behaves like a prompt-first shorthand: it submits a task, starts or reuses the scheduler, and follows that task until the duel finishes.
 - bare `codexlab` now opens a shell-style console in TTY sessions so the operator snapshot stays above a normal prompt instead of re-rendering while you type.
-- `codexlab console` is that shell-style entrypoint explicitly; it accepts plain task text plus `/focus T-0001`, `/all`, `/refresh`, `/clear-tasks`, `/profile ...`, `/auto-switch on|off`, `/sync`, `/run ...`, and `/quit`.
+- `codexlab console` is that shell-style entrypoint explicitly; it accepts plain task text plus `/focus T-0001`, `/all`, `/status`, `/refresh`, `/clear-tasks`, `/profile ...`, `/auto-switch on|off`, `/asymptote on|off`, `/sync`, `/run ...`, and `/quit`.
 - plain text entered at the shell-style console prompt is submitted as a new task immediately; management commands must start with `/`.
 - `codexlab clear-tasks` stops the daemon if needed and clears runtime task history, runs, reservations, events, and task-scoped workspaces so the next task starts again from `T-0001`.
 - `codexlab tui` keeps the old full-screen curses console when you want in-place redraws instead of shell-like input behavior.
 - when `prompt_toolkit` is available, the shell-style console uses it for the prompt line so CJK/IME input behaves more like a normal shell and less like a redrawn TTY app.
 - the shell-style console intentionally leaves the input line bare instead of printing `Prompt>` inline, to reduce IME composition interference.
 - when that prompt path is active, typing `/` now opens a live slash-command completion list, and the menu narrows immediately as you keep typing.
-- resilience profile state now lives in `~/.codexlab/pool.json` by default. When a current profile is selected, `codexlab` injects that profile back into `~/.codex/auth.json` before live work starts.
+- resilience profile state now lives in `~/.codexlab/pool.json` by default. When a current profile is selected, `codexlab` re-injects that profile back into `~/.codex/auth.json` when the main console/TUI opens and mirrors the same auth payload into the repo-local `.codex-home/auth.json` before live Codex work starts.
 - `/profile register` now launches `codex login` inside the same terminal, then captures the resulting `~/.codex/auth.json` into the vault and marks that profile current with the next numbered alias (`1`, `2`, `3`, ...). You can still pass an optional alias override.
 - `/profile activate <account_key|alias>` switches the selected stored profile back into `~/.codex/auth.json` immediately.
 - `/auto-switch on|off` and `/run ...` keep using the same quota-aware account rotation layer.
+- live Codex lanes now run with `danger-full-access` so memory files and built-in tools remain available, but the repo `AGENTS.md` still forbids modifying files outside `/home/usow/codexlab`.
+- `/asymptote on|off` toggles the optional Asymptote side-engine. From the shell-style `codexlab` console, `/asymptote on` now prefers opening a dedicated Asymptote console in a new terminal tab/window when the local desktop supports it, so the main console only keeps a compact one-line summary. When active, Asymptote creates/uses `asymptote/user_prefs.md`, `asymptote/ai_prefs.md`, `asymptote/letters.md`, keeps its runtime state in `asymptote/state.json`, and still exposes the full horizon progress in `status`, `dashboard`, and the dedicated Asymptote console.
+- while Asymptote is active, `/sync` still writes refreshed auth data back into the vault first, then immediately triggers one extra Asymptote pulse from the latest `asymptote/letters.md`.
 - `/useage` probes the current profile's live Codex weekly limit and prints a compact `email + remaining percent` summary.
 - `/useage all` probes every stored profile in isolation and prints the same compact weekly-limit summary for each one.
 - `codexlab codex` launches raw stock Codex inside the lab workspace when you want the underlying tool directly.
 - `dashboard` shows daemon health, corner queues, active runs, current stage, next action, champion/challenger summaries, live scorecards, crowd reaction, recent activity, and explicit `CHAMPION CONFIRMED` outcomes.
+- each task now carries a `proposal` or `patch` mode. Patch bouts are judged with real workspace evidence in mind, not only the written submission body.
+- when a patch bout locks a champion, CodexLab attempts to promote the winner worktree into the target repo. Tasks now surface `apply` state such as `Applied to target repo` or `Not applied`.
 - the dashboard also surfaces the daemon quota monitor so you can see the active login email, blocked lanes, and the latest auto-resume probe result when Codex usage is exhausted.
 - `watch` now defaults to an append-only event stream that prints only meaningful changes such as boxer starts, submissions, judging decisions, title changes, errors, and `CHAMPION CONFIRMED`.
 - the duel logic now uses a symmetric improvement path: the opening loser gets one rematch, and if that overturns the champion, the previous champion gets one matching title defense before the winner locks.
@@ -186,7 +192,7 @@ Task artifacts now also generate readable boxing companion files beside the cano
 - the stream also reprints a compact `Progress:` block only when the tracked task state changes, so `IN PROGRESS` tasks disappear from that block once they lock.
 - `watch --dashboard --until-finished` still re-renders the full operator view continuously for a specific task until the task locks or is cancelled.
 - in real `codex` opening bouts and worker rematches that require both corners, CodexLab now launches both worker runs before waiting so the bout starts concurrently instead of serializing Red then Blue.
-- Worker output contract: JSON with `summary` and `body`.
+- Worker output contract: JSON with `summary` and `body`. CodexLab now also records real workspace evidence from the lane worktree alongside that submission.
 - Evaluator output contract: JSON with `left_rubric`, `right_rubric`, `rationale`, plus `loser_brief` for decisive wins or `rematch_brief` for true ties. These briefs should help corners improve their own submissions, while any pressure from the opposite corner stays optional rather than forcing a rebuttal.
 - Each rubric contains `correctness`, `completeness`, `risk`, `maintainability`, and `verification` on a `0-5` scale.
 - Manual `score` still accepts `--left-score/--right-score` for compatibility and backfills a uniform rubric from those totals.
